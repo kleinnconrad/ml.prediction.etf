@@ -1,4 +1,4 @@
-[![GitHub Repo](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/kleinnconrad/glm-checklist)
+[![GitHub Repo](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/kleinnconrad/analytics.demo.glmchecklist)
 
 
 ## Table of Contents
