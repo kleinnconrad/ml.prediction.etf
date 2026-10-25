@@ -31,7 +31,7 @@ The pipeline applies distinct transformations depending on whether a variable is
 * **Macro Acceleration (2nd Derivative):** Evaluates whether the 1-year macroeconomic trend is accelerating or decelerating compared to 3 months ago.
 * **Rolling Z-Scores (Regime Normalization):** Normalizes stress indicators (like VIX and Credit Spreads) over a rolling 2-year window to determine if current volatility is statistically abnormal for the specific market regime.
 
-<img src="https://github.com/kleinnconrad/etf-predictor/blob/main/docs/sliding_window.png?raw=true" width="50%">
+<img src="https://github.com/kleinnconrad/ml.prediction.etf/blob/main/docs/sliding_window.png?raw=true" width="50%">
 
 #### 4. Temporal Boundaries & Target Isolation
 * **Initialization Phase:** The initial 126 days of the dataset lack sufficient historical data to calculate the 6-month momentum features. Rows falling within this phase are discarded. 
