@@ -1,3 +1,0 @@
-Ticker	Prognose	Prob Up	Prob Flat	Prob Down	CV Accuracy	KS Cutoff	Date
-ZPRS.DE	Up	70.0%	27.2%	2.9%	60.3%	35.0%	28.05.2026
-G2X.DE	Up	80.1%	14.3%	5.7%	67.9%	41.0%	28.05.2026

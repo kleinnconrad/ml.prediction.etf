@@ -46,7 +46,6 @@ I specifically chose to forecast macro ETFs rather than individual equities, fut
 - **`.github/`**: GitHub Actions workflows for automated batch processing, the pre-merge checks and the release process, and the Dependabot configuration.
 - **`artifacts/`**: Persisted output data from batch executions.
 - **`config/`**: Target lists, seed files, and raw data dumps.
-- **`devcontainer/`**: Configuration for reproducible development environments.
 - **`docs/`**: Supplementary project documentation.
 - **`output/`**: Execution outputs, including statistical reports and visualizations.
 - **`scripts/`**: Auxiliary data acquisition and target list curation scripts.
@@ -270,8 +269,7 @@ The pipeline supports an automated batch execution mode for processing large uni
 
 ## Execution (Local & Development)
 
-The repository is configured for GitHub Codespaces. 
-* Dependencies install automatically via the `.devcontainer/devcontainer.json` configuration. 
+* Dependencies are installed with `uv sync --locked` (see [Dependency Management](#dependency-management)).
 * The pipeline is executed via the `python src/main.py` command. 
 * It generates artifacts in the `/output` directory: a visual confusion matrix evaluation (`.png`), the cleaned historical dataset (`.csv`), and a statistical documentation report (`.md`) including predictor ranking and the LLM interpretation.
 
