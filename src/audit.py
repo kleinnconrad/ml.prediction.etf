@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 import re
 from google import genai
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, GEMINI_MODEL
 
 def fetch_ticker_metadata(base_tickers, max_retries=3, delay=60):
     """
@@ -45,7 +45,7 @@ def fetch_ticker_metadata(base_tickers, max_retries=3, delay=60):
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model=GEMINI_MODEL,
                 contents=prompt,
             )
             
