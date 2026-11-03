@@ -11,7 +11,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import confusion_matrix, roc_curve, accuracy_score
 from datetime import datetime
 from google import genai
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, GEMINI_MODEL
 from audit import generate_variable_audit_table
 
 def calculate_smoothed_weights(y_data, smoothing='log'):
@@ -63,7 +63,7 @@ def get_llm_interpretation(coeff_df_string, target_etf, horizon_days, max_retrie
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model=GEMINI_MODEL,
                 contents=prompt,
             )
             return response.text

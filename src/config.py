@@ -201,3 +201,5 @@ def get_all_tickers():
 # 5. LLM CONFIGURATION
 # ==========================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# gemini-2.5-flash is retired in the Gemini API on 2026-12-01; keep scripts/update_catalog.py in line
+GEMINI_MODEL = "gemini-3.5-flash-lite"

@@ -68,7 +68,7 @@ def main():
     print("Checking for missing catalog entries...")
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.5-flash-lite',  # same model as GEMINI_MODEL in src/config.py
             contents=prompt,
         )
         new_rows = response.text.strip()
