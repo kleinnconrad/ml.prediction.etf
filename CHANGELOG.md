@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.0.0](https://github.com/kleinnconrad/ml.prediction.etf/compare/v1.6.1...v2.0.0) (2026-11-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* The parameters moved from src/config.py to config/settings.yaml (TARGET_ETF, ANNUAL_INFLATION_RATE, ANNUAL_MARGIN_UP and ANNUAL_MARGIN_DOWN no longer exist), and src/main.py no longer accepts --batch, --runner-id and --total-runners: one run ranks all target ETFs, and the workflow Pipeline: 2. Run Batch runs as a single job instead of three runners.
+
+### Features
+
+* add uplift charts of the predictions to the dashboard ([5a354a9](https://github.com/kleinnconrad/ml.prediction.etf/commit/5a354a96438a878641055f0d879b9a77808a1b85))
+* add uplift charts to the dashboard and run the batch weekly ([45c3a82](https://github.com/kleinnconrad/ml.prediction.etf/commit/45c3a827464ec774acb519561a23dd6cf3eb6318))
+* replace the per-ETF models with one pooled ETF ranking model ([dc7531b](https://github.com/kleinnconrad/ml.prediction.etf/commit/dc7531baa84a1865687af0cb0ed9a8c3ba8262c3))
+* run the batch pipeline every week ([752ace8](https://github.com/kleinnconrad/ml.prediction.etf/commit/752ace86224521c1bde61e75ebf2d90bcedd4e9a))
+
 ## [1.6.1](https://github.com/kleinnconrad/ml.prediction.etf/compare/v1.6.0...v1.6.1) (2026-11-03)
 
 
