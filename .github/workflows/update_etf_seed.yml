@@ -1,8 +1,11 @@
 name: 'Pipeline: 1. Update Seed'
 
 on:
+  schedule:
+    # Sunday 04:41 UTC: the next Saturday batch run uses the refreshed target list
+    - cron: '41 4 * * 0'
   workflow_dispatch:
-    # Triggered manually from the GitHub Actions tab
+    # Also triggered manually from the GitHub Actions tab
 
 jobs:
   update-etf-seed:
