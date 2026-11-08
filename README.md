@@ -266,7 +266,7 @@ This script evaluates all tickers via the Yahoo Finance API against two criteria
 * **Minimum History (10 years, `min_years_history`):** enough history for the training window of the model.
 * **Liquidity (> 1 million EUR daily turnover):** the average traded value (volume x close) over the last 60 trading days.
 
-The remaining ETFs (currently 156) are written to `config/batch_targets.json`, the target list of the batch run and of the variable review.
+The remaining ETFs (currently 156) are written to `config/batch_targets.json`, the target list of the batch run and of the variable review. The workflow `Pipeline: 1. Update Seed` refreshes the list every Sunday, so the Saturday batch run uses the list of the previous Sunday.
 
 ---
 
@@ -294,7 +294,7 @@ The remaining ETFs (currently 156) are written to `config/batch_targets.json`, t
 
 | Workflow | Trigger | Function |
 |---|---|---|
-| `Pipeline: 1. Update Seed` (`update_etf_seed.yml`) | Manual | Downloads the Xetra T7 dump, regenerates the seed list and the target list `config/batch_targets.json` |
+| `Pipeline: 1. Update Seed` (`update_etf_seed.yml`) | Every Sunday at 04:41 UTC, and manual | Downloads the Xetra T7 dump, regenerates the seed list and the target list `config/batch_targets.json` |
 | `Pipeline: 2. Run Batch` (`manual_batch.yml`) | Every Saturday at 05:23 UTC, and manual | Runs the pooled model (`src/main.py`) and commits `artifacts/latest_batch_results.json`, the archive `artifacts/history/` and `artifacts/uplift_report.json` |
 | `Pipeline: 3. Quarterly Variable Review` (`variable_review.yml`) | 2nd of February, May, August and November, and manual | Runs the review, commits its report and, on a switch, opens a pull request that changes `champion_features` and `champion_adopted` |
 | `CI: Pre-Merge Checks` (`ci.yml`) | Pull requests and pushes to `main` | Lock file, lint and tests (see [Continuous Integration](#continuous-integration)) |
