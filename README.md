@@ -283,7 +283,7 @@ The remaining ETFs (currently 156) are written to `config/batch_targets.json`, t
 **Uplift report (`artifacts/uplift_report.json`)**, written by `src/main.py` after the archive, or by `uv run python src/uplift.py` without a batch run: for the archived reports closest to 30, 90 and 180 days ago (`uplift_lookback_days`, within `uplift_match_tolerance_days` = 15), the return of every ranked ETF from its first close on or after the report date to the latest close (adjusted closes, so distributions are included), averaged per cohort: `Up`, `Not Up` and all ranked ETFs (`baseline`). Each lookback lists the report and scoring dates, whether the gate had passed, the realized period, the mean returns, the cohort sizes and the ranked ETFs without prices; a lookback without a matching report is `null`. An empty cohort is `null`, not a 0% return.
 
 **Dashboard uplift section (`index.html`):**
-- *Live:* one bar chart per lookback (1, 3 and 6 months) with the mean return of the `Not Up` and `Up` cohorts and a dashed line for all ranked ETFs; until an archived report of that age exists, the chart reads "not enough history yet". The first report was archived on 2026-11-08, so the 1-month chart fills from about 2026-11-23, the 3-month chart from about 2027-01-22 and the 6-month chart from about 2027-04-22, provided the batch runs in those windows.
+- *Live:* one bar chart per lookback (1, 3 and 6 months) with the mean return of the `Not Up` and `Up` cohorts and a dashed line for all ranked ETFs; until an archived report of that age exists, the chart reads "not enough history yet". The first report was archived on 2026-11-08; with the weekly batch runs, the 1-month chart fills from about 2026-11-23, the 3-month chart from about 2027-01-22 and the 6-month chart from about 2027-04-22.
 - *Walk-forward backtest:* the 6-month return of the top share and of all ranked ETFs after every test month-end of the walk-forward validation (`validation_per_date`), with the mean uplift, the number of dates on which the top share was ahead and the uplift per year.
 
 **Review reports (`artifacts/variable_reviews/review_YYYY-MM-DD.json` and `.md`)**, written by `scripts/review_variables.py`: the decision and its reasons, the multiple-testing correction, the paired comparison per challenger, the AUC per year, the selected features per year and the per-date tables.
@@ -295,12 +295,12 @@ The remaining ETFs (currently 156) are written to `config/batch_targets.json`, t
 | Workflow | Trigger | Function |
 |---|---|---|
 | `Pipeline: 1. Update Seed` (`update_etf_seed.yml`) | Manual | Downloads the Xetra T7 dump, regenerates the seed list and the target list `config/batch_targets.json` |
-| `Pipeline: 2. Run Batch` (`manual_batch.yml`) | Manual | Runs the pooled model (`src/main.py`) and commits `artifacts/latest_batch_results.json`, the archive `artifacts/history/` and `artifacts/uplift_report.json` |
+| `Pipeline: 2. Run Batch` (`manual_batch.yml`) | Every Saturday at 05:23 UTC, and manual | Runs the pooled model (`src/main.py`) and commits `artifacts/latest_batch_results.json`, the archive `artifacts/history/` and `artifacts/uplift_report.json` |
 | `Pipeline: 3. Quarterly Variable Review` (`variable_review.yml`) | 2nd of February, May, August and November, and manual | Runs the review, commits its report and, on a switch, opens a pull request that changes `champion_features` and `champion_adopted` |
 | `CI: Pre-Merge Checks` (`ci.yml`) | Pull requests and pushes to `main` | Lock file, lint and tests (see [Continuous Integration](#continuous-integration)) |
 | `Release: Release Please` (`release-please.yml`) | Pushes to `main` | Release pull requests and the changelog |
 
-A pull request opened by the review workflow with the `GITHUB_TOKEN` starts its CI run only after approval (`Approve workflows to run` in the merge box). The live uplift charts need archived reports from about 1, 3 and 6 months ago (within 15 days), so the batch should run at least every two to four weeks.
+A pull request opened by the review workflow with the `GITHUB_TOKEN` starts its CI run only after approval (`Approve workflows to run` in the merge box). The batch runs every week because the live uplift charts need archived reports from about 1, 3 and 6 months ago (within 15 days); a Saturday run scores the Friday close.
 
 ---
 
