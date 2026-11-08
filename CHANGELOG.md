@@ -5,12 +5,15 @@
 
 ### ⚠ BREAKING CHANGES
 
+* The per-ETF models (one multinomial regression per ETF on macro variables, ANOVA pre-filter and stepwise selection in every run, Kolmogorov-Smirnov cutoff for Down) are replaced by one pooled logistic regression for all target ETFs with a fixed champion set of 9 price features ranked within each date. Reason: the per-ETF validation graded the feature selection on its own folds and reported about 70% accuracy even for targets without any predictable component, while a walk-forward re-run was below a constant forecast. The feature set now changes only through the quarterly variable review and a merged pull request.
+* The forecast is a ranking instead of three return classes. Down, Flat and Up from absolute thresholds (Down meant a 6-month return below +1.2%) are replaced by Up for the top 10% of the daily ranking by the probability of a gain of at least 10% over 126 trading days, and Not Up for all other ETFs. No ETF is Up if the walk-forward validation gate fails.
+* artifacts/latest_batch_results.json has a new schema. The fields model, validation_per_date and target replace baseline_parameters, and every entry of results has prediction_class (1 Up, 0 Not Up), prediction_label, probability, rank, n_ranked, top_percent, latest_price, status, feature_values, feature_percentiles and logit_contributions instead of prob_up, prob_flat, prob_down, cv_accuracy, quality_gate_passed, ks_cutoff, selected_features and feature_weights. Consumers of the file, such as the hedging repository, need to read the new fields.
+* FRED data and the Gemini interpretation are removed, so FRED_API_KEY and GEMINI_API_KEY are no longer used. The per-ETF variable audit, the catalog workflow with scripts/update_catalog.py, docs/var_catalog.md, docs/features.sql and the output folder are gone. Macro information enters only as each ETF's exposure to eight daily Yahoo Finance factors in the candidate pool of the variable review.
 * The parameters moved from src/config.py to config/settings.yaml (TARGET_ETF, ANNUAL_INFLATION_RATE, ANNUAL_MARGIN_UP and ANNUAL_MARGIN_DOWN no longer exist), and src/main.py no longer accepts --batch, --runner-id and --total-runners: one run ranks all target ETFs, and the workflow Pipeline: 2. Run Batch runs as a single job instead of three runners.
 
 ### Features
 
 * add uplift charts of the predictions to the dashboard ([5a354a9](https://github.com/kleinnconrad/ml.prediction.etf/commit/5a354a96438a878641055f0d879b9a77808a1b85))
-* add uplift charts to the dashboard and run the batch weekly ([45c3a82](https://github.com/kleinnconrad/ml.prediction.etf/commit/45c3a827464ec774acb519561a23dd6cf3eb6318))
 * replace the per-ETF models with one pooled ETF ranking model ([dc7531b](https://github.com/kleinnconrad/ml.prediction.etf/commit/dc7531baa84a1865687af0cb0ed9a8c3ba8262c3))
 * run the batch pipeline every week ([752ace8](https://github.com/kleinnconrad/ml.prediction.etf/commit/752ace86224521c1bde61e75ebf2d90bcedd4e9a))
 
