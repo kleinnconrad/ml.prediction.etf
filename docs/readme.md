@@ -1,59 +1,53 @@
-### Feature Engineering Architecture
+# Feature Engineering
 
-**Table of Contents**
-- [1. Data Merging & Imputation](#1-data-merging--imputation)
-- [2. Interaction Effects (Macro Ratios)](#2-interaction-effects-macro-ratios)
-- [3. Advanced Quantitative Feature Engineering](#3-advanced-quantitative-feature-engineering)
-- [4. Temporal Boundaries & Target Isolation](#4-temporal-boundaries--target-isolation)
-- [5. Outlier Treatment (Winsorization)](#5-outlier-treatment-winsorization)
-- [6. Z-Score Normalization](#6-z-score-normalization)
+## Table of Contents
+- [1. ETF Series on Own Trading Days](#1-etf-series-on-own-trading-days)
+- [2. Point in Time](#2-point-in-time)
+- [3. Union Calendar and Eligibility](#3-union-calendar-and-eligibility)
+- [4. Within-Date Ranks](#4-within-date-ranks)
+- [5. Month-End Panel and Label](#5-month-end-panel-and-label)
+- [6. Macro Exposure Candidates](#6-macro-exposure-candidates)
+- [Other Documents](#other-documents)
 
-The feature engineering pipeline processes a 10-year historical dataset using a row-by-row sliding window. This continuous timeframe captures multiple macroeconomic regimes and establishes a statistical baseline for feature scaling. 
+The feature engineering is implemented in `src/features.py`. It turns the daily prices of the target ETFs, the market index and the macro factors into a long panel with one row per eligible ETF and month-end, which the pooled model (`src/modeling.py`) and the variable review (`src/variable_review.py`) use.
 
-For every trading day in the dataset, the algorithm executes a backward-looking function to engineer predictor variables and a forward-looking function to establish the target classification. 
+### 1. ETF Series on Own Trading Days
 
-#### 1. Data Merging & Imputation
-* Macroeconomic indicators sourced from FRED are published at lower frequencies (typically monthly) than daily equity pricing. 
-* To reconcile these datasets, the pipeline applies a forward-fill imputation strategy upon merging. Each daily observation for a macroeconomic variable inherits the most recent published value, ensuring the model exclusively consumes "point-in-time" verified data. 
-* This logic forces the algorithm to recognize macro regime shifts only as they occur, preventing look-ahead bias and aligning physical economic reality with high-frequency market dynamics.
-* **Hard History Validation:** After merging, the pipeline evaluates the historical length of each individual macro predictor against a centralized minimum history parameter (e.g., 10 years). Predictors that violate this threshold (allowing for a 365-day grace period for publication lags) are explicitly dropped. This prevents a single short-history variable from silently truncating the entire multi-year dataset during NA-dropping.
+Every feature is computed per ETF on the days on which the ETF has a close (its own trading days). A feature function receives the ETF's adjusted open, high, low, close and volume on these days, the market index carried to them and the macro factor series. Intermediate series that several features share (returns, moving averages, rolling extremes, factor changes) are computed once per ETF. The registry `FEATURE_FUNCTIONS` holds 277 named features in 16 families; the pooled model computes only the features in `champion_features`.
 
-#### 2. Interaction Effects (Macro Ratios)
-* Instead of relying on raw asset prices, the pipeline deterministically engineers specific economic ratios (Interaction Effects) directly into the historical matrix.
-* These ratios represent tangible market spreads (e.g., Copper/Gold for growth vs. inflation, HYG/LQD for credit stress, SPY/TLT for risk appetite).
-* By structuring features as spreads, the model reads relative outperformance rather than single-asset drift.
+### 2. Point in Time
 
-#### 3. Advanced Quantitative Feature Engineering
-The pipeline applies distinct transformations depending on whether a variable is an absolute asset price (structurally drifting) or a rate/spread (naturally stationary):
-* **Preserving Stationary Levels:** For interest rates, spreads, and volatility indices (e.g., VIX, Yield Curve), the absolute levels are preserved as the model must recognize specific thresholds (e.g., yield curve inversion below 0).
-* **Multi-Timeframe Momentum:** The backward window calculates 1-month, 3-month, 6-month, and 1-year momentum. For prices, this is computed as percentage returns (`pct_change`). For rates/spreads, it is calculated as absolute point differences (`diff`).
-* **Distance to Trend (Mean Reversion):** Calculates the distance of an asset to its 200-day Simple Moving Average (SMA) to identify overextensions.
-* **Macro Acceleration (2nd Derivative):** Evaluates whether the 1-year macroeconomic trend is accelerating or decelerating compared to 3 months ago.
-* **Rolling Z-Scores (Regime Normalization):** Normalizes stress indicators (like VIX and Credit Spreads) over a rolling 2-year window to determine if current volatility is statistically abnormal for the specific market regime.
+* Features use trailing windows only: a feature on day t depends on prices up to t. A test truncates the inputs after a date and checks that no feature on that date changes.
+* The market index (EUNL.DE) trades on Xetra and closes with the ETFs; it is carried with its close on or before each own trading day.
+* The macro factors (US and global markets, currencies and futures) close after Xetra. Each own trading day gets the last factor close dated before that day, so a factor move after the Xetra close of day t enters the features of the next trading day.
+* No price level is a feature: a past adjusted close depends on splits and distributions that happened later.
 
-<img src="https://github.com/kleinnconrad/ml.prediction.etf/blob/main/docs/sliding_window.png?raw=true" width="50%">
+### 3. Union Calendar and Eligibility
 
-#### 4. Temporal Boundaries & Target Isolation
-* **Initialization Phase:** The initial 126 days of the dataset lack sufficient historical data to calculate the 6-month momentum features. Rows falling within this phase are discarded. 
-* **Terminal Phase:** The forward window evaluates the price of the target asset exactly 126 trading days in the future. The final 126 days of the historical dataset lack this future price data required to assign a target class. 
-* **Live Prediction:** The absolute latest row in this terminal phase is isolated and passed to the inference engine for live prediction. All other rows lacking a target class are excluded from the training matrix.
+The own-day rows of all ETFs are placed on the union calendar of their trading days. A day without a trade carries the ETF's last trading day for at most `ffill_limit_days` (5) days; after that the ETF has no price (`stale_price`). An ETF is eligible on a date if it has at least `min_history_days` (253) own trading days up to the date, a positive 126-day traded value, a price above `min_price_eur` and a last trade within the carry limit. The rule does not depend on the feature list.
 
-#### 5. Outlier Treatment (Winsorization)
-* Financial markets exhibit non-normal distributions with "fat tails" (e.g., flash crashes, extreme macroeconomic shocks).
-* To prevent extreme volatility spikes from artificially expanding the standard deviation and "squashing" normal cyclic signals during normalization, the dataset is subjected to deterministic clipping.
-* All feature variables are clipped at the 1st and 99th percentiles. Crucially, these thresholds are calculated *exclusively* on the historical training rows and identically applied to the live prediction row to prevent look-ahead bias.
+### 4. Within-Date Ranks
 
-#### 6. Z-Score Normalization
-* The continuous, clipped return variables are transformed into Z-scores. 
-* This standardizes the data distribution, neutralizing the magnitude differences between highly volatile assets (e.g., Crypto) and slow-moving spreads (e.g., Copper/Gold).
+On every date, each feature of the eligible ETFs is converted to its percentile rank among the eligible ETFs that have a value (ties share their average rank), minus 0.5. The inputs therefore lie between -0.5 and 0.5, and a median ETF has 0. An eligible ETF without a value gets the neutral rank 0. Ranks remove the scale of a feature, bound extreme values and do not need a scaler fitted on training data.
 
-The resulting output is a two-dimensional matrix. The primary key is the valid trading date. The columns consist of a single discrete target variable and approximately 150 continuous, scaled features representing the multi-timeframe momentum of the macro universe and its deterministic interactions.
+### 5. Month-End Panel and Label
 
-| date | target_class | spy_1M_scaled | spy_3M_scaled | spy_6M_scaled | ratio_copper_gold_1M_scaled | ... up to X150 |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 2016-11-20 | 1 | 0.85 | 1.12 | 0.45 | -0.30 | ... |
-| 2016-11-21 | 1 | 0.91 | 1.15 | 0.48 | -0.25 | ... |
-| ... | ... | ... | ... | ... | ... | ... |
-| 2020-03-15 | -1 | -3.50 | -4.10 | -2.80 | -2.10 | ... |
-| ... | ... | ... | ... | ... | ... | ... |
-| 2025-11-23 | 0 | 0.15 | -0.10 | 0.22 | 1.05 | ... |
+The model uses the last trading day of every calendar month. The forward return of a row is `close[t + 126] / close[t] - 1`, with 126 counted in the ETF's own trading days, and `label_end` is the date of that later close. The label is 1 if the forward return reaches `threshold` (10%) and unknown while the later close does not exist. Training rows always have a `label_end` before the first date that the model is scored on, so no training outcome overlaps a test or scoring period. The layout of the long panel (illustrative values):
+
+| date | ticker | r_ret_21 | r_mom_12_1 | r_vol_126 | ... | fwd | label_end | y |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 2025-03-31 | EXS1.DE | -0.21 | 0.12 | 0.18 | ... | 0.08 | 2025-09-26 | 0 |
+| 2025-03-31 | SXR8.DE | -0.35 | 0.27 | 0.22 | ... | 0.11 | 2025-09-29 | 1 |
+| ... | ... | ... | ... | ... | ... | ... | ... | ... |
+
+### 6. Macro Exposure Candidates
+
+A macro factor has the same value for every ETF on a date, so it cannot rank the ETFs directly. The family `macro_exposure` of the review pool measures each ETF's sensitivity instead:
+* `beta_<factor>_<window>`: the slope of the ETF's 5-day returns on the factor's 5-day changes over 126 or 252 days. 5-day changes reduce the effect of the different closing times.
+* `expo_<factor>_<k>`: the 252-day beta times the factor's change over the last 21, 63 or 126 days. On one date it orders the ETFs by their beta when the factor has risen and in reverse order when it has fallen.
+
+The factors are fixed in `src/features.py` (`MACRO_FACTOR_KINDS`); their Yahoo Finance tickers are settings (`macro_factor_tickers`). A price factor changes relatively, a yield or volatility index by differences, and the credit factor is the relative change of HYG minus that of LQD.
+
+## Other Documents
+
+* `glm_checklist.md`: The GLM modeling checklist applied to the pooled model.

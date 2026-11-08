@@ -3,108 +3,39 @@ name: 'Pipeline: 2. Run Batch'
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+# One batch run at a time
+concurrency:
+  group: run-batch
+  cancel-in-progress: false
+
 jobs:
   run-batch:
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 3
-      matrix:
-        runner_id: [1, 2, 3]
-
+    # The limit stops a hanging download
+    timeout-minutes: 60
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v7
+      - name: Checkout Repository
+        uses: actions/checkout@v7
 
-    - name: Setup Python
-      uses: actions/setup-python@v7
-      with:
-        python-version-file: 'pyproject.toml'
-        cache: 'pip'
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
 
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install .
+      # One pooled model for all target ETFs: downloads the prices, validates, fits and
+      # ranks, and writes artifacts/latest_batch_results.json
+      - name: Run the pooled model
+        run: uv run --locked python src/main.py
 
-    - name: Run ETF Batch Pipeline (Distributed)
-      env:
-        FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      run: |
-        python src/main.py --batch --runner-id ${{ matrix.runner_id }} --total-runners 3
-
-    - name: Save Temporary Batch Artifact
-      uses: actions/upload-artifact@v7
-      with:
-        name: batch-result-${{ matrix.runner_id }}
-        path: output/batch_results_runner_${{ matrix.runner_id }}.json
-        retention-days: 1
-
-  # Finaler Job, der darauf wartet, dass alle 3 Server fertig sind
-  merge-results:
-    needs: run-batch
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v7
-
-    - name: Download all partial batch results
-      uses: actions/download-artifact@v8
-      with:
-        path: downloaded_artifacts
-
-    - name: Setup Python
-      uses: actions/setup-python@v7
-      with:
-        python-version-file: 'pyproject.toml'
-
-    - name: Merge JSONs and Commit
-      run: |
-        python -c "
-        import json, glob, os
-        final_results = []
-        exec_time = ''
-        baseline_params = {}
-        
-        # Iteriere über alle heruntergeladenen Artefakte
-        for f in glob.glob('downloaded_artifacts/**/*.json', recursive=True):
-            with open(f, 'r') as file:
-                data = json.load(file)
-                final_results.extend(data.get('results', []))
-                
-                # Nimm Zeit und Parameter vom ersten gefundenen Artefakt (sind überall identisch)
-                if not exec_time:
-                    exec_time = data.get('execution_time', '')
-                if not baseline_params:
-                    baseline_params = data.get('baseline_parameters', {})
-                    
-        # Baue die finale, konsolidierte JSON auf
-        final_output = {
-            'execution_time': exec_time,
-            'total_processed': len(final_results),
-            'baseline_parameters': baseline_params,
-            'results': final_results
-        }
-        
-        # Speichere die Datei direkt in den finalen Ordner
-        os.makedirs('artifacts', exist_ok=True)
-        with open('artifacts/latest_batch_results.json', 'w', encoding='utf-8') as out:
-            json.dump(final_output, out, indent=4)
-        "
-        
-        # Konfiguriere den Git-Bot
-        git config --local user.name "github-actions[bot]"
-        git config --local user.email "github-actions[bot]@users.noreply.github.com"
-        
-        # Füge die Datei hinzu und committe
-        git add artifacts/latest_batch_results.json
-        git commit -m "Auto-Update: Merged 3-Runner Batch Results [skip ci]" || echo "Keine Änderungen zum Committen gefunden."
-        
-        # Hole die neuesten Änderungen vom aktuellen Branch und lege den Commit oben drauf
-        git pull --rebase origin ${{ github.ref_name }}
-        
-        # Pushe sicher zurück
-        git push origin HEAD:${{ github.ref_name }}
+      - name: Commit the batch results
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add artifacts/latest_batch_results.json
+          git commit -m "chore: update batch results [skip ci]" || echo "No changes to commit"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
