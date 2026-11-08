@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.0](https://github.com/kleinnconrad/ml.prediction.etf/compare/v2.0.0...v2.1.0) (2026-11-08)
+
+
+### Features
+
+* update the ETF target list every Sunday ([f89cf86](https://github.com/kleinnconrad/ml.prediction.etf/commit/f89cf86c1187b19959a76b206508c1d48afe1ae4))
+
 ## [2.0.0](https://github.com/kleinnconrad/ml.prediction.etf/compare/v1.6.1...v2.0.0) (2026-11-08)
 
 
