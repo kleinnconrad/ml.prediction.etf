@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.1](https://github.com/kleinnconrad/ml.prediction.etf/compare/v1.6.0...v1.6.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* switch the Gemini calls to gemini-3.5-flash-lite ([5c32902](https://github.com/kleinnconrad/ml.prediction.etf/commit/5c329027a6377dce8760c58517fe115ff662736b))
+* switch the Gemini calls to gemini-3.5-flash-lite ([1c2f056](https://github.com/kleinnconrad/ml.prediction.etf/commit/1c2f056b62239d1d6e1ab947fccaefe4fc020af7))
+
 ## [1.6.0](https://github.com/kleinnconrad/ml.prediction.etf/compare/v1.5.0...v1.6.0) (2026-10-09)
 
 
