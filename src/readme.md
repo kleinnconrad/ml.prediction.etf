@@ -14,6 +14,7 @@ This directory contains the core logic of the pooled ETF ranking model. The modu
 * `modeling.py`: The pooled L2 logistic regression, the yearly walk-forward validation with the per-date AUC and its block-bootstrap interval, the model gate, the ranking with the Up decision (top `up_share`) and the per-ETF entries of the batch report.
 * `variable_review.py`: The quarterly champion-challenger review of the feature set: candidate pool, selection procedures (stepwise with ANOVA prefilter, lasso, Fama-MacBeth screen, all candidates), walk-forward comparison, multiple-testing correction, switch rule, reports and the settings update.
 * `reporting.py`: Logging setup, the atomic JSON writer and the batch report `artifacts/latest_batch_results.json`.
+* `uplift.py`: The archive of the batch reports (`artifacts/history/`) and the uplift report `artifacts/uplift_report.json`: the realized returns of the Up and Not Up cohorts of the archived reports of 1, 3 and 6 months ago against all ranked ETFs.
 * `main.py`: Command line entry point of the batch run.
 * `app.py`: Streamlit app that runs the pooled model on demand and shows the gate, the validation, the ranking and the details of one ETF.
 
@@ -39,6 +40,6 @@ sequenceDiagram
     Features-->>Model: Long panel
     Model->>Model: Walk-forward validation, gate, final fit, ranking
     Model-->>Main: ModelResult
-    Main->>FS: latest_batch_results.json (batch run)
+    Main->>FS: latest_batch_results.json, history archive, uplift_report.json (batch run)
     Main-->>User: Ranking, gate and validation
 ```

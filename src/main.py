@@ -3,8 +3,10 @@ Entry point of the ETF predictor: one pooled cross-sectional model for all targe
 
 Downloads the prices of the target ETFs (config/batch_targets.json), the market index and
 the macro factors, runs the pooled model (src/modeling.py) and writes the batch report
-artifacts/latest_batch_results.json. The workflow `Pipeline: 2. Run Batch` runs this
-module and commits the report.
+artifacts/latest_batch_results.json. Next to the batch report, it archives a compact copy as
+history/YYYY-MM/report_YYYY-MM-DD.json and writes uplift_report.json, the realized returns of
+the archived reports of 1, 3 and 6 months ago (src/uplift.py). The workflow
+`Pipeline: 2. Run Batch` runs this module and commits the three outputs.
 
 Usage (from the repository root):
     uv run python src/main.py [--ticker TICKER ...] [--price-cache DIR] [--output FILE]
@@ -15,10 +17,13 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+import pandas as pd
+
 from config import BATCH_RESULTS_PATH, load_settings, load_universe
 from modeling import ModelResult, etf_prediction, run_pooled_model
 from prices import PricePanel, fetch_price_panel, load_price_panel, save_price_panel
 from reporting import build_batch_report, configure_logging, write_json_atomic
+from uplift import archive_path, compact_report, evaluate_uplift, prune_history
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +44,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--price-cache', type=Path, default=None,
                         help="directory of a CSV price cache: read if it exists, otherwise downloaded and written")
     parser.add_argument('--output', type=Path, default=BATCH_RESULTS_PATH,
-                        help=f"batch report file (default: {BATCH_RESULTS_PATH.relative_to(BATCH_RESULTS_PATH.parents[1])})")
+                        help=f"batch report file (default: {BATCH_RESULTS_PATH.relative_to(BATCH_RESULTS_PATH.parents[1])}); "
+                             "the archive history/ and uplift_report.json are written next to it")
     return parser.parse_args(argv)
 
 
@@ -90,6 +96,28 @@ def log_ticker_details(result: ModelResult, tickers: Sequence[str]) -> None:
                         f"log-odds contribution {contribution}")
 
 
+def write_history_and_uplift(report: dict, prices: PricePanel, directory: Path, settings: dict) -> None:
+    """
+    Archives the batch report and writes the uplift report of the archived predictions.
+
+    Args:
+        report (dict): The batch report of this run.
+        prices (PricePanel): The prices of this run (their closes measure the realized returns).
+        directory (Path): Directory of the batch report; history/ and uplift_report.json go here.
+        settings (dict): Loaded settings.
+    """
+    run_date = pd.Timestamp(report['execution_time']).date()
+    history_dir = directory / 'history'
+    archived = archive_path(history_dir, run_date)
+    write_json_atomic(archived, compact_report(report))
+    prune_history(history_dir, run_date, int(settings['history_retention_days']))
+    uplift = evaluate_uplift(history_dir, prices.close, run_date, settings)
+    write_json_atomic(directory / 'uplift_report.json', uplift)
+    available = [label for label, horizon in uplift['horizons'].items() if horizon]
+    logger.info(f"Archived {archived}; uplift report with {len(available)} of {len(uplift['horizons'])} "
+                f"lookbacks: {available or 'none yet'}.")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """
     Runs the pooled model on the target ETFs and writes the batch report.
@@ -112,6 +140,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_json_atomic(args.output, report)
     logger.info(f"Wrote {args.output}: {len(report['results'])} ETFs, {len(result.up_tickers)} Up "
                 f"(gate {'passed' if result.summary['gate']['passed'] else 'failed'}).")
+    write_history_and_uplift(report, prices, args.output.parent, settings)
     log_ticker_details(result, args.ticker)
     return 0
 

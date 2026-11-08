@@ -83,6 +83,23 @@
             margin-top: 10px;
         }
 
+        .uplift-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 15px;
+            margin: 10px 0 20px 0;
+        }
+
+        .uplift-cell {
+            border: 1px dashed var(--text-main);
+            padding: 10px;
+        }
+
+        .uplift-note {
+            color: #aaaaaa;
+            font-size: 0.9em;
+        }
+
         .chart-container {
             border: 1px dashed var(--text-main);
             padding: 10px;
@@ -158,6 +175,10 @@
                 grid-template-columns: 1fr 1fr;
             }
 
+            .uplift-grid {
+                grid-template-columns: 1fr;
+            }
+
             .flex-header {
                 flex-direction: column;
                 align-items: flex-start;
@@ -225,6 +246,35 @@
                 <h3>Top-Share Hit Rate</h3>
                 <div class="metric-value" id="kpi-hit">-</div>
             </div>
+        </div>
+
+        <div class="info-box" id="uplift-section">
+            <h4>[ Prediction Uplift: Live ]</h4>
+            <p class="uplift-note">Realized return of the published predictions: for the archived batch reports
+                closest to 1, 3 and 6 months ago, the return of every ranked ETF from its first close on or after the
+                report date to the latest close, averaged per cohort. The dashed line is the average of all ranked
+                ETFs; the uplift is the difference between Up and that line.</p>
+            <p id="uplift-live-meta" class="uplift-note"></p>
+            <div class="uplift-grid">
+                <div class="uplift-cell">
+                    <div id="uplift-plot-1m"></div>
+                    <p id="uplift-text-1m"></p>
+                </div>
+                <div class="uplift-cell">
+                    <div id="uplift-plot-3m"></div>
+                    <p id="uplift-text-3m"></p>
+                </div>
+                <div class="uplift-cell">
+                    <div id="uplift-plot-6m"></div>
+                    <p id="uplift-text-6m"></p>
+                </div>
+            </div>
+            <h4>[ Prediction Uplift: Walk-Forward Backtest ]</h4>
+            <p class="uplift-note">Out of sample: for every test month-end of the walk-forward validation, the model
+                refitted before that year ranked the ETFs; shown is the 6-month return of its top share (Up) and of all
+                ranked ETFs. The target list is today's, so ETFs closed in the meantime are missing.</p>
+            <p id="uplift-wf-text"></p>
+            <div id="uplift-wf-plot" style="width: 100%; min-height: 20px;"></div>
         </div>
 
         <div class="chart-container">
@@ -304,6 +354,7 @@
                 allResults = data.results;
                 renderTopEtfs(allResults);
                 applyFilterAndSort();
+                renderWalkForwardUplift(data.validation_per_date || [], cross.up_share);
                 // The chart library comes from a CDN; the figures above do not depend on it
                 if (typeof Plotly === 'undefined') {
                     document.getElementById('auc-plot').innerText =
@@ -315,6 +366,120 @@
                 console.error("Error loading or parsing JSON:", error);
                 showError('Error loading or parsing data. See Console (F12) for details.');
             }
+        }
+
+        const UPLIFT_URL = 'artifacts/uplift_report.json';
+        const HORIZON_LABELS = { '1m': '1 Month', '3m': '3 Months', '6m': '6 Months' };
+        const PLOT_FONT = { color: '#fff', family: 'monospace' };
+
+        function signedPct(value, digits = 1) {
+            if (value === null || value === undefined) return '-';
+            const text = `${(value * 100).toFixed(digits)}%`;
+            return value > 0 ? `+${text}` : text;
+        }
+
+        function signedPoints(value, digits = 1) {
+            if (value === null || value === undefined) return '-';
+            const text = `${(value * 100).toFixed(digits)} pp`;
+            return value > 0 ? `+${text}` : text;
+        }
+
+        async function loadUplift() {
+            try {
+                const response = await fetch(UPLIFT_URL);
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                renderLiveUplift(await response.json());
+            } catch (error) {
+                console.warn("Uplift report not available:", error);
+                document.getElementById('uplift-live-meta').innerText =
+                    'No uplift report yet; the workflow "Pipeline: 2. Run Batch" writes it.';
+            }
+        }
+
+        function renderLiveUplift(uplift) {
+            const horizons = uplift.horizons || {};
+            const matched = Object.keys(horizons).filter(key => horizons[key]);
+            document.getElementById('uplift-live-meta').innerText =
+                `Evaluated on ${uplift.generated_for}; archived reports within ${uplift.tolerance_days} days of ` +
+                `each lookback are used (${matched.length} of ${Object.keys(horizons).length} available).`;
+            ['1m', '3m', '6m'].forEach(key => {
+                const label = HORIZON_LABELS[key];
+                const textEl = document.getElementById(`uplift-text-${key}`);
+                const plotEl = document.getElementById(`uplift-plot-${key}`);
+                const horizon = horizons[key];
+                if (!horizon) {
+                    textEl.innerText = `${label}: not enough history yet (no archived report from about ` +
+                        `${(uplift.lookback_days || {})[key] ?? '?'} days ago).`;
+                    return;
+                }
+                const m = horizon.metrics, n = horizon.counts;
+                const upliftPoints = (m.Up !== null && m.baseline !== null) ? m.Up - m.baseline : null;
+                textEl.innerText =
+                    `${label}: report ${horizon.report_date}, ${horizon.days} days to ${horizon.end}. ` +
+                    `Up ${signedPct(m.Up)} (n=${n.Up}), Not Up ${signedPct(m['Not Up'])} (n=${n['Not Up']}), ` +
+                    `all ranked ${signedPct(m.baseline)} (n=${n.baseline}); uplift ${signedPoints(upliftPoints)}` +
+                    (horizon.gate_passed === false ? '; the model gate had failed, so no ETF was Up.' : '.');
+                if (typeof Plotly === 'undefined') return;
+                const value = v => (v === null || v === undefined) ? null : v * 100;
+                const bars = {
+                    type: 'bar', x: ['Not Up', 'Up'], y: [value(m['Not Up']), value(m.Up)], name: 'Cohort return',
+                    marker: { color: ['rgba(255,255,255,0.15)', 'rgba(255,255,255,0.75)'], line: { color: '#fff', width: 1 } },
+                    text: [`n=${n['Not Up']}`, `n=${n.Up}`], textposition: 'auto', hovertemplate: '%{x}: %{y:.2f}%<extra></extra>'
+                };
+                const baseline = {
+                    type: 'scatter', mode: 'lines', x: ['Not Up', 'Up'], y: [value(m.baseline), value(m.baseline)],
+                    name: 'All ranked ETFs', line: { color: '#aaaaaa', dash: 'dash', width: 2 },
+                    hovertemplate: 'All ranked: %{y:.2f}%<extra></extra>'
+                };
+                plotEl.style.height = '260px';
+                Plotly.newPlot(plotEl, [bars, baseline], {
+                    title: { text: label, font: PLOT_FONT },
+                    yaxis: { ticksuffix: '%', tickfont: PLOT_FONT, gridcolor: '#444', zerolinecolor: '#888' },
+                    xaxis: { tickfont: PLOT_FONT },
+                    showlegend: false, paper_bgcolor: '#000', plot_bgcolor: '#000',
+                    margin: { l: 50, r: 10, t: 40, b: 30 }
+                }, { responsive: true, displayModeBar: false });
+            });
+        }
+
+        function renderWalkForwardUplift(perDate, upShare) {
+            const rows = perDate.filter(row => row.top_fwd !== null && row.top_fwd !== undefined &&
+                row.universe_fwd !== null && row.universe_fwd !== undefined);
+            const textEl = document.getElementById('uplift-wf-text');
+            if (rows.length === 0) {
+                textEl.innerText = 'No walk-forward test dates in the batch report.';
+                return;
+            }
+            const mean = values => values.reduce((a, b) => a + b, 0) / values.length;
+            const top = mean(rows.map(row => row.top_fwd));
+            const all = mean(rows.map(row => row.universe_fwd));
+            const ahead = rows.filter(row => row.top_fwd > row.universe_fwd).length;
+            const years = {};
+            rows.forEach(row => { (years[row.year] = years[row.year] || []).push(row.top_fwd - row.universe_fwd); });
+            const perYear = Object.keys(years).sort().map(year => `${year} ${signedPoints(mean(years[year]))}`).join(', ');
+            textEl.innerText =
+                `Mean 6-month return after a test month-end (${rows[0].date} to ${rows[rows.length - 1].date}, ` +
+                `${rows.length} dates): Up (top ${pct(upShare, 0)}) ${signedPct(top)}, all ranked ETFs ${signedPct(all)}; ` +
+                `uplift ${signedPoints(top - all)}. Up was ahead on ${ahead} of ${rows.length} dates. ` +
+                `Uplift per year: ${perYear}.`;
+            if (typeof Plotly === 'undefined') return;
+            const series = (key, name, line) => ({
+                type: 'scatter', mode: 'lines+markers', name, x: rows.map(row => row.date),
+                y: rows.map(row => row[key] * 100), line, marker: { size: 4, color: line.color },
+                hovertemplate: `${name}: %{y:.1f}%<extra>%{x}</extra>`
+            });
+            const plotEl = document.getElementById('uplift-wf-plot');
+            plotEl.style.height = '380px';
+            Plotly.newPlot(plotEl, [
+                series('top_fwd', 'Up (top share)', { color: '#ffffff', width: 2 }),
+                series('universe_fwd', 'All ranked ETFs', { color: '#888888', width: 2, dash: 'dash' })
+            ], {
+                title: { text: '6-Month Return after each Test Month-End (Walk-Forward)', font: PLOT_FONT },
+                yaxis: { ticksuffix: '%', tickfont: PLOT_FONT, gridcolor: '#444', zerolinecolor: '#888' },
+                xaxis: { tickfont: PLOT_FONT, gridcolor: '#444' },
+                legend: { font: PLOT_FONT }, hovermode: 'x unified',
+                paper_bgcolor: '#000', plot_bgcolor: '#000', margin: { l: 60, r: 20, t: 40, b: 50 }
+            }, { responsive: true });
         }
 
         function renderModel(model) {
@@ -431,7 +596,7 @@
             });
         }
 
-        loadData();
+        loadData().then(loadUplift);
     </script>
 
 </body>

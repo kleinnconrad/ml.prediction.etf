@@ -25,6 +25,11 @@ bootstrap_replications: 2000         # bootstrap replications of the mean per-da
 bootstrap_seed: 0                    # random seed of the bootstrap
 min_validation_auc_lower: 0.5        # model gate: no ETF is Up unless the lower 95% CI bound of the validation AUC exceeds this value
 
+# Uplift of the published predictions (src/uplift.py): every batch run archives its report under artifacts/history
+uplift_lookback_days: {1m: 30, 3m: 90, 6m: 180}  # the archived reports closest to these many days ago are evaluated against the latest close
+uplift_match_tolerance_days: 15      # maximum distance in days between a lookback date and an archived report
+history_retention_days: 400          # archived reports older than this are deleted; must exceed the longest lookback plus the tolerance
+
 # Target universe (scripts/build_etf_batch.py writes config/batch_targets.json)
 min_years_history: 10                # minimum price history of a target ETF in years
 

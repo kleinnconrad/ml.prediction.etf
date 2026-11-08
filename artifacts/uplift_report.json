@@ -1,0 +1,14 @@
+{
+  "generated_for": "2026-11-08",
+  "lookback_days": {
+    "1m": 30,
+    "3m": 90,
+    "6m": 180
+  },
+  "tolerance_days": 15,
+  "horizons": {
+    "1m": null,
+    "3m": null,
+    "6m": null
+  }
+}
