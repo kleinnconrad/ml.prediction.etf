@@ -1,5 +1,6 @@
 [![GitHub Repo](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/kleinnconrad/analytics.demo.glmchecklist)
 
+# GLM Checklist
 
 ## Table of Contents
 - [1. Data Preparation](#1-data-preparation)
@@ -8,27 +9,29 @@
 - [4. Training & Validation (Validation Strategy)](#4-training--validation-validation-strategy)
 - [5. Model Evaluation & Business Metrics](#5-model-evaluation--business-metrics)
 
+The checklist applied to the pooled cross-sectional logistic regression of release 2.0.0 (`src/modeling.py`).
+
 ### 1. Data Preparation
-* **Imputation [✅ Pass]:** Missing values were appropriately replaced. *Implementation: Forward-fill (`.ffill()`) applied to lower-frequency FRED data upon merging to strictly prevent look-ahead bias.*
-* **Outlier Handling [✅ Pass]:** Extreme data points were identified and adequately handled. *Implementation: Deterministic Winsorization (clipping at 1st and 99th percentiles) derived exclusively from training data.*
-* **Skewness [⚠️ Partial Pass / Deliberate Choice]:** Highly skewed distributions were analyzed and transformed. *Implementation: Explicit log transformations are omitted because transforming absolute prices into rolling percentage momentum naturally centers the distribution, and clipping handles the extremes.*
-* **Scaling & Normalization [✅ Pass]:** Numerical variables were scaled to ensure a uniform magnitude. *Implementation: `StandardScaler` (Z-transformation) applied safely post-split to normalize volatility across distinct asset classes.*
-* **Categorization (Binning) [✅ Pass]:** Continuous variables were grouped into meaningful ordinal classes. *Implementation: Continuous future returns are dynamically binned into discrete `Up`, `Flat`, and `Down` target classes based on inflation and margin parameters.*
+* **Imputation [Pass]:** Missing values are handled explicitly. *Implementation: A day without a trade carries the ETF's last trading day for at most 5 days; an eligible ETF without a feature value gets the neutral rank 0 (the median).*
+* **Outlier Handling [Pass]:** Extreme values cannot dominate the fit. *Implementation: Every input is a within-date percentile rank between -0.5 and 0.5.*
+* **Skewness [Pass]:** Skewed raw distributions are transformed. *Implementation: Within-date ranks are uniformly distributed by construction.*
+* **Scaling & Normalization [Pass]:** All inputs share one scale. *Implementation: Ranks need no scaler fitted on training data, so no scaling parameter is estimated on test data.*
+* **Categorization (Binning) [Partial Pass / Deliberate Choice]:** The continuous forward return is binned into a binary target. *Implementation: A gain of at least 10% over 126 trading days. With an absolute threshold, volatile ETFs reach the target more often; the README section Expected Performance and Limitations quantifies this.*
 
 ### 2. Feature Engineering & Selection
-* **Pattern Features [✅ Pass]:** Complex behavioral patterns were extracted. *Implementation: Static absolute prices are transformed into rolling temporal patterns (1M, 3M, 6M percentage returns).*
-* **Interaction Effects [✅ Pass]:** Relevant interactions were identified and included. *Implementation: Deterministic macroeconomic spreads/ratios (e.g., Copper/Gold, HYG/LQD) are explicitly engineered.*
-* **Multicollinearity [✅ Pass]:** High correlations between independent variables were checked and removed. *Implementation: Handled mechanically via the strict 5-fold cross-validated Sequential Feature Selection.*
-* **Variable Selection (Stepwise Selection) [✅ Pass]:** Significant predictors were systematically selected. *Implementation: A two-stage wrapper approach using `SelectKBest` (ANOVA F-test) as a pre-filter, followed by `SequentialFeatureSelector` (forward selection).*
+* **Pattern Features [Pass]:** Behavioral patterns are extracted from trailing windows. *Implementation: Returns, momentum, moving-average distances and volatilities on each ETF's own trading days; tests check that no feature uses data after its date.*
+* **Interaction Effects [Pass]:** Relevant interactions are available. *Implementation: The review pool contains each ETF's beta to eight macro factors and the beta times the recent factor change.*
+* **Multicollinearity [Pass]:** Correlated predictors are controlled. *Implementation: L2 regularization (C = 0.1) and a small fixed champion set of 9 features.*
+* **Variable Selection (Stepwise Selection) [Pass]:** Predictors are selected without grading the selection on its own rows. *Implementation: A fixed champion set in production. The quarterly review re-runs ANOVA-prefiltered stepwise selection, lasso and a Fama-MacBeth screen inside every walk-forward training window and switches only under a Bonferroni-corrected switch rule.*
 
 ### 3. Model Setup
-* **Link Function & Distribution Family [✅ Pass]:** The response variable was correctly assessed and the appropriate link function applied. *Implementation: `LogisticRegression` mechanically applies the Multinomial distribution family and Softmax link function for the 3-class target.*
+* **Link Function & Distribution Family [Pass]:** The response is binary. *Implementation: Binomial logistic regression (logit link), pooled across all ETFs with one intercept and shared coefficients.*
 
 ### 4. Training & Validation (Validation Strategy)
-* **Out-of-Time Validation [✅ Pass]:** The data split was performed with a strict temporal shift to prevent data leakage. *Implementation: `TimeSeriesSplit` utilizing the `gap=horizon` parameter guarantees training windows never overlap with evaluation windows.*
-* **Overfitting / Underfitting Check [✅ Pass]:** Model performance was compared across datasets. *Implementation: Automated generation and comparison of In-Sample (Training) versus Out-of-Sample (Cross-Validation) advanced confusion matrices.*
+* **Out-of-Time Validation [Pass]:** Training and test periods do not overlap. *Implementation: Yearly walk-forward refits over 8 years; every training label ends before the first test date of its year.*
+* **Overfitting / Underfitting Check [Pass]:** In-sample and out-of-sample performance are compared. *Implementation: The batch report lists the in-sample and out-of-sample AUC of every validation year.*
 
 ### 5. Model Evaluation & Business Metrics
-* **Optimal Cutoff Point [✅ Pass]:** The classification threshold was optimized in a data-driven manner. *Implementation: Dynamic threshold optimization using the Kolmogorov-Smirnov (KS) statistic specifically calibrates the trigger point for the `Down` class.*
-* **Alpha & Beta Error Analysis [✅ Pass]:** The tolerance for False Positives and False Negatives was weighed. *Implementation: Dynamic logarithmic class weighting mathematically penalizes the model for missing minority classes, combating base-rate bias.*
-* **Uplift Modeling [✅ Pass]:** The incremental value of the model compared to a baseline strategy was quantified. *Implementation: A mandatory "Quality Gate" requires Out-of-Fold (OOF) accuracy to definitively exceed a baseline threshold before forecasting artifacts are generated.*
+* **Optimal Cutoff Point [Deliberate Choice]:** No probability cutoff is tuned. *Implementation: The top 10% of the daily ranking are Up (`up_share`), if the lower bound of the 95% interval of the validation AUC is above 0.5.*
+* **Alpha & Beta Error Analysis [Pass]:** Hits and misses of the decision are measured. *Implementation: The top-share hit rate against the base rate on every test date.*
+* **Uplift Modeling [Pass]:** The value of the decision against a baseline is quantified. *Implementation: The mean forward return of the top share minus that of all ranked ETFs, per test date and overall.*

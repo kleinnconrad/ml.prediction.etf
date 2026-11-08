@@ -1,349 +1,758 @@
-import time
-import pandas as pd
+"""
+Pooled cross-sectional logistic regression for all ETFs.
+
+Complete pooling: a single L2-regularized logistic regression with one shared intercept
+and shared coefficients is fitted on the month-end rows of all ETFs. Its inputs are the
+within-date percentile ranks of the features in `champion_features`, so the model ranks the
+ETFs of a date against each other; it does not forecast the direction of the market. The
+target is absolute: an ETF is a positive case if its close `horizon_days` trading days
+later is at least `threshold` above the current close. On the scoring date (the last
+closed trading day), the top `up_share` of the ranked ETFs are Up and the others Not Up.
+
+A walk-forward validation is recomputed on every run. Each of the last `validation_years`
+calendar years is scored by a model refitted on the rows whose forward return ended before
+the first test month-end of that year. The mean per-date cross-sectional AUC and its
+moving-block bootstrap CI form the model gate: if the lower CI bound is at or below
+`min_validation_auc_lower`, no ETF is Up.
+"""
+import logging
+import math
+import warnings
+from dataclasses import dataclass
+from fractions import Fraction
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
-import os
-import matplotlib.pyplot as plt
-import seaborn as sns
-from collections import Counter
+import pandas as pd
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
-from sklearn.feature_selection import SequentialFeatureSelector, SelectKBest, f_classif
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import confusion_matrix, roc_curve, accuracy_score
-from datetime import datetime
-from google import genai
-from config import GEMINI_API_KEY, GEMINI_MODEL
-from audit import generate_variable_audit_table
+from sklearn.metrics import roc_auc_score
 
-def calculate_smoothed_weights(y_data, smoothing='log'):
-    class_counts = Counter(y_data)
-    majority_count = max(class_counts.values())
-    
-    weights = {}
-    for cls, count in class_counts.items():
-        ratio = majority_count / count
-        if smoothing == 'sqrt':
-            weights[cls] = round(float(np.sqrt(ratio)), 2)
-        elif smoothing == 'log':
-            weights[cls] = round(float(np.log10(ratio) + 1.0), 2)
-        else:
-            weights[cls] = round(float(ratio), 2)
-    return weights
+from prices import PricePanel
+from features import (RANK_PREFIX, FeaturePanel, build_feature_panel, month_end_dates,
+                                   rank_columns, to_long_panel, validate_feature_names)
 
-def get_llm_interpretation(coeff_df_string, target_etf, horizon_days, max_retries=3, delay=10):
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "DEIN_API_KEY_HIER":
-        return "> *No API key provided. LLM analysis skipped.*"
-    
-    # Roughly calculate the months for the prompt (21 trading days = 1 month)
-    horizon_months = max(1, horizon_days // 21)
-    
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    
-    prompt = f"""
-    You are a quantitative macro-analyst at a hedge fund. My model for predicting 
-    the market state (Up, Down, Flat) for {target_etf} (Horizon: {horizon_months} months) has 
-    selected and weighted the following predictors based on a stepwise variable selection 
-    (Suffixes at the end show the momentum window or feature type, e.g., _126D_ret, _126D_diff, _Dist_SMA200, _Level):
-    
-    {coeff_df_string}
-    
-    Provide a highly elaborate but extremely precise economic assessment of 
-    why this specific set of indicators currently acts as a leading indicator. 
-    
-    Rules for the output:
-    - Absolute ban on continuous text and rambling. 
-    - Answer exclusively in crisp bullet points.
-    - Use hard, institutional logic (correlations, yield curve, sector rotations).
-    
-    Structure your answer strictly into these three short blocks:
-    **1. Macroeconomic Setup:** (Why were interest rates/currencies/commodities chosen or ignored?)
-    **2. Sector & Market Dynamics:** (What do the selected equities/sectors reveal about the business cycle?)
-    **3. Quant Conclusion:** (What is the overarching narrative for {target_etf} in the next {horizon_months} months?)
+logger = logging.getLogger(__name__)
+
+MODEL_NAME = 'pooled_cross_sectional_logit'
+SOLVER = 'lbfgs'                    # fixed design decision; C, tol and max_iter are settings
+CI_PERCENTILES = (2.5, 97.5)        # two-sided 95% percentile interval of the bootstrap
+
+STATUS_OK = 'ok'
+STATUS_GATE_FAILED = 'model_gate_failed'
+NOT_ELIGIBLE = 'not_eligible'
+# Reasons why an ETF is not ranked. When several apply, the first one in this order is
+# reported (not_eligible_reasons); the model summary lists the counts in the same order.
+INELIGIBLE_REASONS = ('stale_price', 'insufficient_history', 'price_at_or_below_min', 'no_traded_value')
+
+GATE_INSUFFICIENT_DATES = 'insufficient_validation_dates'
+GATE_LOW_AUC = 'auc_ci_lower_at_or_below_threshold'
+GATE_NO_TRAINING_ROWS = 'no_training_rows'
+GATE_SINGLE_CLASS_TRAINING = 'single_class_training'
+
+# Published classes of the ranking
+CLASS_UP = 'Up'
+CLASS_NOT_UP = 'Not Up'
+
+# Settings that define the model; copied into the model summary
+SUMMARY_PARAMETER_KEYS = (
+    'horizon_days', 'threshold', 'champion_features', 'champion_adopted', 'model_history_years',
+    'feature_warmup_years', 'model_l2_c', 'model_solver_tol', 'model_max_iter', 'up_share', 'min_price_eur',
+    'min_history_days', 'ffill_limit_days', 'validation_years', 'min_etfs_per_date',
+    'bootstrap_block_months', 'bootstrap_replications', 'bootstrap_seed',
+    'min_validation_auc_lower', 'market_index_ticker', 'macro_factor_tickers',
+)
+
+
+def _iso(value: Any) -> Optional[str]:
+    """Returns the ISO date of a timestamp-like value, or None for a missing value."""
+    if value is None or pd.isna(value):
+        return None
+    return pd.Timestamp(value).date().isoformat()
+
+
+def _num(value: Any, digits: Optional[int] = None) -> Optional[float]:
+    """Returns a finite Python float (optionally rounded), or None."""
+    if value is None:
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return round(number, digits) if digits is not None else number
+
+
+def _mean(values: Sequence[float]) -> float:
+    """Mean of the finite values, NaN if there are none."""
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    return float(array.mean()) if array.size else float('nan')
+
+
+def _feature_name(column: str) -> str:
+    """Returns the feature name of a rank column ('r_ret_21' -> 'ret_21')."""
+    return column[len(RANK_PREFIX):] if column.startswith(RANK_PREFIX) else column
+
+
+def fit_pooled_model(X: Any, y: Any, settings: Dict[str, Any]) -> LogisticRegression:
     """
-    
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            return response.text
-        except Exception as e:
-            error_msg = str(e).upper()
-            if any(err in error_msg for err in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"]):
-                if attempt < max_retries - 1:
-                    print(f"Google Server-Spike (503/429). Attempt {attempt+1}/{max_retries} failed. Waiting {delay} seconds...")
-                    time.sleep(delay)
-                    continue
-            return f"> *Error during LLM request: {e}*"
+    Fits the pooled L2 logistic regression (one shared intercept and shared coefficients).
 
-# --- NEW FUNCTION: DUAL CUTOFF ---
-def apply_dual_cutoffs(probs, classes, down_cutoff, up_cutoff):
+    Args:
+        X (Any): Rank features, rows x features (array or DataFrame).
+        y (Any): Binary labels (0/1).
+        settings (Dict[str, Any]): Loaded settings (model_l2_c, model_solver_tol, model_max_iter).
+
+    Returns:
+        LogisticRegression: The fitted model. Class weights are not used.
+
+    Raises:
+        ValueError: If the labels contain a single class.
     """
-    Applies strict cutoffs for downside risk and the upside hurdle.
-    Priority:
-    1. If prob_down >= down_cutoff -> DOWN (-1)
-    2. If prob_up >= up_cutoff -> UP (1)
-    3. Else -> FLAT (0)
+    max_iter = int(settings['model_max_iter'])
+    model = LogisticRegression(C=float(settings['model_l2_c']), solver=SOLVER,
+                               tol=float(settings['model_solver_tol']), max_iter=max_iter)
+    with warnings.catch_warnings():
+        # Reported once through the log below instead of a warning per refit
+        warnings.simplefilter('ignore', ConvergenceWarning)
+        model.fit(np.asarray(X, dtype=float), np.asarray(y, dtype=float).astype(int))
+    if int(np.max(model.n_iter_)) >= max_iter:
+        logger.warning(f"The pooled model did not converge within {max_iter} iterations.")
+    return model
+
+
+def predict_probability(model: LogisticRegression, X: Any) -> np.ndarray:
     """
-    adjusted_preds = np.zeros(len(probs), dtype=int)
-    
-    down_idx = list(classes).index(-1) if -1 in classes else -1
-    up_idx = list(classes).index(1) if 1 in classes else -1
-    
-    for i in range(len(probs)):
-        p_down = probs[i, down_idx] if down_idx != -1 else 0
-        p_up = probs[i, up_idx] if up_idx != -1 else 0
-        
-        # 1. Emergency brake: Downside risk too high
-        if p_down >= down_cutoff:
-            adjusted_preds[i] = -1
-        # 2. High hurdle for Up: Only with extreme certainty
-        elif p_up >= up_cutoff:
-            adjusted_preds[i] = 1
-        # 3. No extremes: The market runs sideways (Flat)
-        else:
-            adjusted_preds[i] = 0
-            
-    return adjusted_preds
-# ----------------------------------
+    Returns the predicted probability of class 1 (the +threshold target).
 
-# IMPORTANT: The signature has received a new parameter 'up_cutoff_value'!
-def perform_feature_selection(X_scaled, y, latest_features_scaled, target_etf, horizon, final_features=12, pre_filter_k=80, timestamp=None, up_cutoff_value=0.65):
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: Executing Feature Selection (Pre-Filter: Top {pre_filter_k} variables)...")
-    
-    # Class weighting
-    custom_weights = calculate_smoothed_weights(y, smoothing='log')
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: Dynamic Algorithm Weighting (Log-Smoothed): {custom_weights}")
-    
-    k_actual = min(pre_filter_k, X_scaled.shape[1])
-    kbest = SelectKBest(score_func=f_classif, k=k_actual)
-    
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: Starting SelectKBest (ANOVA)...")
-    kbest.fit(X_scaled, y)
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: SelectKBest complete.")
-    
-    features_stage_1 = X_scaled.columns[kbest.get_support()]
-    rejected_stage_1 = X_scaled.columns[~kbest.get_support()]
-    X_stage_1 = X_scaled[features_stage_1]
-    
-    initial_train_size = 252 * 3 
-    if initial_train_size >= len(X_stage_1):
-        initial_train_size = len(X_stage_1) // 2
-        
-    test_size = (len(X_stage_1) - initial_train_size - (5 * horizon)) // 5
-    if test_size < 1:
-        test_size = 1
+    Args:
+        model (LogisticRegression): A fitted model.
+        X (Any): Rank features, rows x features.
 
-    tscv = TimeSeriesSplit(n_splits=5, gap=horizon, max_train_size=None, test_size=test_size)
-    
-    log_reg_base = LogisticRegression(solver='lbfgs', max_iter=200, class_weight=custom_weights)
-    
-    sfs = SequentialFeatureSelector(log_reg_base, n_features_to_select=final_features, direction='forward', cv=tscv, n_jobs=-1)
-    
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: Starting SequentialFeatureSelector (SFS). This may take a few minutes...")
-    sfs.fit(X_stage_1, y)
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: SFS complete.")
-    
-    selected_features = features_stage_1[sfs.get_support()]
-    rejected_stage_2 = features_stage_1[~sfs.get_support()]
-    X_optimal = X_scaled[selected_features]
-    
-    model = LogisticRegression(solver='lbfgs', max_iter=1000, class_weight=custom_weights)
-    
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: Fitting final Logistic Regression...")
-    model.fit(X_optimal, y)
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: Final fit complete. Starting OOF Evaluation...")
+    Returns:
+        np.ndarray: Probabilities.
+    """
+    return model.predict_proba(np.asarray(X, dtype=float))[:, 1]
 
-    # 1. Out-of-Fold (OOF) Evaluation
-    oof_preds = np.full(len(y), np.nan)
-    oof_probs = np.full((len(y), len(model.classes_)), np.nan)
-    
-    for train_idx, test_idx in tscv.split(X_optimal):
-        X_train, y_train = X_optimal.iloc[train_idx], y.iloc[train_idx]
-        X_test = X_optimal.iloc[test_idx]
-        
-        fold_model = LogisticRegression(solver='lbfgs', max_iter=1000, class_weight=custom_weights)
-        fold_model.fit(X_train, y_train)
-        
-        oof_preds[test_idx] = fold_model.predict(X_test)
-        oof_probs[test_idx] = fold_model.predict_proba(X_test)
-        
-    valid_indices = ~np.isnan(oof_preds)
-    y_valid = y.iloc[valid_indices]
-    oof_probs_valid = oof_probs[valid_indices]
-    
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: OOF Evaluation complete.")
 
-    # 2. KS-Statistic (Cutoff optimization for class -1)
-    y_down_true = (y_valid == -1).astype(int)
-    optimal_down_threshold = 0.33 
-    
-    if -1 in model.classes_:
-        down_idx = list(model.classes_).index(-1)
-        y_down_prob = oof_probs_valid[:, down_idx]
-        
-        fpr, tpr, thresholds = roc_curve(y_down_true, y_down_prob)
-        ks_stats = tpr - fpr
-        max_ks_idx = np.argmax(ks_stats)
-        optimal_down_threshold = thresholds[max_ks_idx]
-        print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: KS-Statistic optimized: Down-Cutoff is at {optimal_down_threshold:.2%}")
+def per_date_auc(df: pd.DataFrame, prob_col: str, label_col: str, min_etfs: int) -> pd.Series:
+    """
+    Computes the cross-sectional ROC AUC of every date.
 
-    # ==========================================
-    # NEW: Apply strict hurdle for Up
-    print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: Strict Up-hurdle (Cutoff) set to {up_cutoff_value:.2%}")
-    # ==========================================
+    Dates with fewer than `min_etfs` labeled rows or a single class are skipped.
 
-    # 3. Matrix synchronization with the DUAL-Cutoff
-    oof_preds_dual = apply_dual_cutoffs(oof_probs_valid, model.classes_, optimal_down_threshold, up_cutoff_value)
-    
-    train_probs = model.predict_proba(X_optimal)
-    train_preds_dual = apply_dual_cutoffs(train_probs, model.classes_, optimal_down_threshold, up_cutoff_value)
+    Args:
+        df (pd.DataFrame): Rows indexed by (date, ticker).
+        prob_col (str): Column with the predicted probabilities.
+        label_col (str): Column with the 0/1 labels (NaN rows are ignored).
+        min_etfs (int): Minimum labeled rows of a date.
 
-    # 4. Quality Gate 
-    cv_accuracy = accuracy_score(y_valid, oof_preds_dual)
-    is_valid_quality = cv_accuracy >= 0.35
+    Returns:
+        pd.Series: AUC per date (sorted by date), only for the dates that qualify.
+    """
+    values: Dict[pd.Timestamp, float] = {}
+    for date, group in df.groupby(level='date', sort=True):
+        y = group[label_col].to_numpy(dtype=float)
+        p = group[prob_col].to_numpy(dtype=float)
+        keep = ~np.isnan(y) & ~np.isnan(p)
+        y, p = y[keep], p[keep]
+        if y.size < min_etfs or np.unique(y).size < 2:
+            continue
+        values[pd.Timestamp(date)] = float(roc_auc_score(y, p))
+    return pd.Series(values, dtype=float, name='auc').sort_index()
 
-    def plot_advanced_cm(y_true, y_pred, classes, title, accuracy):
-        cm = confusion_matrix(y_true, y_pred, labels=classes)
-        row_sums = cm.sum(axis=1)[:, np.newaxis]
-        cm_perc = np.divide(cm.astype('float'), row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums!=0)
-        
-        labels = [f"{v1}\n({v2:.1%})" for v1, v2 in zip(cm.flatten(), cm_perc.flatten())]
-        labels = np.asarray(labels).reshape(cm.shape)
-        
-        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
-        sns.heatmap(cm, annot=labels, fmt='', cmap='Blues', 
-                    xticklabels=classes, yticklabels=classes, ax=ax, cbar=False,
-                    annot_kws={"size": 11, "weight": "bold"})
-        
-        ax.set_ylabel('Actual Market (True)', fontsize=12, fontweight='bold', labelpad=10)
-        ax.set_xlabel('Model Forecast (Predicted)', fontsize=12, fontweight='bold', labelpad=10)
-        ax.set_title(f"{title}\nAccuracy: {accuracy:.2%}", fontsize=14, fontweight='bold', pad=15)
-        
-        plt.xticks(fontsize=11)
-        plt.yticks(fontsize=11, rotation=0)
-        fig.patch.set_alpha(0.0) 
-        plt.tight_layout()
-        plt.close(fig)
-        return fig
 
-    train_accuracy = accuracy_score(y, train_preds_dual)
-    fig_cm_train = plot_advanced_cm(y, train_preds_dual, model.classes_, "1. In-Sample (Training)", train_accuracy)
-    fig_cm_cv = plot_advanced_cm(y_valid, oof_preds_dual, model.classes_, "2. Out-of-Sample (Cross-Validation)", cv_accuracy)
+def block_bootstrap_ci(values: Sequence[float], block: int, replications: int, seed: int,
+                       percentiles: Tuple[float, float] = CI_PERCENTILES) -> Dict[str, float]:
+    """
+    Moving-block bootstrap of the mean of a date-ordered series.
 
-    # 5. Live Predict Logic (Dual Cutoff applied)
-    X_latest_optimal = latest_features_scaled[selected_features]
-    probabilities = model.predict_proba(X_latest_optimal)[0]
-    
-    prob_dict = dict(zip(model.classes_, probabilities))
-    prob_down = prob_dict.get(-1, 0)
-    prob_up = prob_dict.get(1, 0)
-    
-    # --- Live Predict Dual Cutoff Logic ---
-    if prob_down >= optimal_down_threshold:
-        prediction = -1
-    elif prob_up >= up_cutoff_value:
-        prediction = 1
+    Every replication concatenates randomly chosen blocks of `block` consecutive values
+    (overlapping block starts, drawn with replacement) until the series length is reached.
+    The interval is given by two percentiles of the replicated means (by default 2.5% and
+    97.5%, a two-sided 95% interval).
+
+    Args:
+        values (Sequence[float]): The series in date order; non-finite values are dropped.
+        block (int): Block length (consecutive dates).
+        replications (int): Number of bootstrap replications.
+        seed (int): Seed of numpy's default random generator.
+        percentiles (Tuple[float, float]): Lower and upper percentile (0-100) of the interval.
+
+    Returns:
+        Dict[str, float]: mean, n, ci_lower, ci_upper and boot_sd. The interval is NaN if
+        the series has fewer than two blocks of values.
+    """
+    x = np.asarray(values, dtype=float)
+    x = x[np.isfinite(x)]
+    n = int(x.size)
+    result: Dict[str, float] = {'mean': float(x.mean()) if n else float('nan'), 'n': n,
+                                'ci_lower': float('nan'), 'ci_upper': float('nan'), 'boot_sd': float('nan')}
+    if block < 1 or replications < 1 or n < 2 * block:
+        return result
+    rng = np.random.default_rng(seed)
+    n_blocks = int(np.ceil(n / block))
+    starts = np.arange(n - block + 1)
+    offsets = np.arange(block)
+    means = np.empty(replications)
+    for i in range(replications):
+        chosen = rng.choice(starts, size=n_blocks, replace=True)
+        idx = (chosen[:, None] + offsets[None, :]).ravel()[:n]
+        means[i] = x[idx].mean()
+    result['ci_lower'] = float(np.percentile(means, percentiles[0]))
+    result['ci_upper'] = float(np.percentile(means, percentiles[1]))
+    result['boot_sd'] = float(np.std(means))
+    return result
+
+
+def n_up_for(n_ranked: int, up_share: float) -> int:
+    """
+    Number of UP ETFs among `n` ranked ETFs: min(n, max(1, floor(up_share * n + 0.5))).
+
+    The product is computed in exact decimal arithmetic on the share as written in the
+    settings, so a binary floating-point error cannot round it down (0.35 * 90 + 0.5 is
+    32, while the float product 0.35 * 90 is 31.499999999999996).
+
+    Args:
+        n_ranked (int): Number of ranked ETFs.
+        up_share (float): Share of the ranking marked UP (`up_share`).
+
+    Returns:
+        int: The top-share size (0 if nothing is ranked).
+    """
+    if n_ranked <= 0:
+        return 0
+    share = Fraction(str(up_share))
+    return min(n_ranked, max(1, math.floor(share * n_ranked + Fraction(1, 2))))
+
+
+def rank_by_probability(probability: pd.Series) -> pd.Series:
+    """
+    Ranks ETFs by probability: 1 = highest; ties are broken by ticker, ascending.
+
+    Args:
+        probability (pd.Series): Probabilities indexed by ticker.
+
+    Returns:
+        pd.Series: Integer ranks with the index of `probability`.
+    """
+    order = pd.DataFrame({'p': probability.to_numpy(dtype=float),
+                          't': [str(t) for t in probability.index]})
+    order = order.sort_values(['p', 't'], ascending=[False, True], kind='mergesort')
+    ranks = np.empty(len(order), dtype=int)
+    ranks[order.index.to_numpy()] = np.arange(1, len(order) + 1)
+    return pd.Series(ranks, index=probability.index, name='rank')
+
+
+def top_share_mask(probability: pd.Series, up_share: float) -> np.ndarray:
+    """
+    Marks the top-share ETFs of one date (same rule as the UP decision).
+
+    Args:
+        probability (pd.Series): Probabilities indexed by ticker.
+        up_share (float): Share of the ranking to mark.
+
+    Returns:
+        np.ndarray: Boolean mask aligned with `probability`.
+    """
+    ranks = rank_by_probability(probability).to_numpy()
+    return ranks <= n_up_for(len(ranks), up_share)
+
+
+@dataclass
+class ValidationResult:
+    """
+    Result of the walk-forward validation.
+
+    Attributes:
+        years (List[Dict[str, Any]]): One entry per test year (fitted or skipped with a
+            status); the coefficients of a fitted year are keyed by feature name, as in the
+            model summary.
+        overall (Dict[str, Any]): Metrics over all test dates, including the bootstrap CI.
+        per_date (pd.DataFrame): One row per test date (date, year, n, auc, n_top,
+            top_hit_rate, base_rate, top_fwd, universe_fwd, top_minus_universe_fwd).
+    """
+    years: List[Dict[str, Any]]
+    overall: Dict[str, Any]
+    per_date: pd.DataFrame
+
+
+PER_DATE_COLUMNS = ['date', 'year', 'n', 'auc', 'n_top', 'top_hit_rate', 'base_rate',
+                    'top_fwd', 'universe_fwd', 'top_minus_universe_fwd']
+
+
+def per_date_table(test: pd.DataFrame, year: int, up_share: float, min_etfs: int) -> pd.DataFrame:
+    """
+    Per-date metrics of the scored test rows of one year.
+
+    Args:
+        test (pd.DataFrame): Test rows indexed by (date, ticker) with y, fwd and probability.
+        year (int): The test year.
+        up_share (float): Top share used for the hit rate and the return spread.
+        min_etfs (int): Minimum labeled rows of a date for its AUC.
+
+    Returns:
+        pd.DataFrame: One row per date with the PER_DATE_COLUMNS.
+    """
+    auc = per_date_auc(test, 'probability', 'y', min_etfs)
+    rows = []
+    for date, group in test.groupby(level='date', sort=True):
+        prob = pd.Series(group['probability'].to_numpy(), index=group.index.get_level_values('ticker'))
+        top = top_share_mask(prob, up_share)
+        y = group['y'].to_numpy(dtype=float)
+        fwd = group['fwd'].to_numpy(dtype=float)
+        top_fwd = float(fwd[top].mean())
+        universe_fwd = float(fwd.mean())
+        rows.append({
+            'date': pd.Timestamp(date), 'year': year, 'n': int(len(group)),
+            'auc': float(auc.get(pd.Timestamp(date), float('nan'))), 'n_top': int(top.sum()),
+            'top_hit_rate': float(y[top].mean()), 'base_rate': float(y.mean()),
+            'top_fwd': top_fwd, 'universe_fwd': universe_fwd,
+            'top_minus_universe_fwd': top_fwd - universe_fwd,
+        })
+    return pd.DataFrame(rows, columns=PER_DATE_COLUMNS)
+
+
+@dataclass
+class WalkForwardWindow:
+    """
+    One yearly refit of the walk-forward validation.
+
+    Attributes:
+        year (int): The test year.
+        status (str): 'ok', 'no_test_rows', 'no_training_rows' or 'single_class_training'.
+        test (np.ndarray): Boolean mask of the test rows (labels known, dated in the year).
+        train (np.ndarray): Boolean mask of the training rows (all False unless test rows exist).
+        test_start (Optional[pd.Timestamp]): First test date (None without test rows).
+    """
+    year: int
+    status: str
+    test: np.ndarray
+    train: np.ndarray
+    test_start: Optional[pd.Timestamp]
+
+
+def walk_forward_windows(dates: pd.DatetimeIndex, label_end: np.ndarray, y: np.ndarray,
+                         scoring_date: pd.Timestamp, n_years: int, history_years: int) -> List[WalkForwardWindow]:
+    """
+    The training and test rows of each yearly walk-forward refit.
+
+    The test years are the `n_years` calendar years ending with the year of the scoring
+    date. A test row needs a known label (label_end <= scoring_date). The training rows of
+    a year have a known label, label_end before the year's first test date, a date before
+    it and a date within `history_years` of it.
+
+    Args:
+        dates (pd.DatetimeIndex): Date of every row of the long panel.
+        label_end (np.ndarray): Label end date of every row (datetime64[ns]; NaT if unknown).
+        y (np.ndarray): Labels (NaN if unknown).
+        scoring_date (pd.Timestamp): Last date of the union calendar.
+        n_years (int): Number of test years.
+        history_years (int): Maximum training window in years.
+
+    Returns:
+        List[WalkForwardWindow]: One window per test year, in order.
+    """
+    scoring_date = pd.Timestamp(scoring_date)
+    history = pd.DateOffset(years=int(history_years))
+    dates = pd.DatetimeIndex(dates)
+    label_end = np.asarray(label_end, dtype='datetime64[ns]')
+    y = np.asarray(y, dtype=float)
+    known = ~np.isnan(y) & (label_end <= np.datetime64(scoring_date)) & np.asarray(dates <= scoring_date)
+    none = np.zeros(len(dates), dtype=bool)
+    windows: List[WalkForwardWindow] = []
+    for year in range(scoring_date.year - int(n_years) + 1, scoring_date.year + 1):
+        test = known & np.asarray(dates.year == year)
+        if not test.any():
+            windows.append(WalkForwardWindow(year, 'no_test_rows', none, none, None))
+            continue
+        test_start = dates[test].min()
+        train = (known & (label_end < np.datetime64(test_start)) & np.asarray(dates < test_start)
+                 & np.asarray(dates >= test_start - history))
+        status = 'ok'
+        if not train.any():
+            status = 'no_training_rows'
+        elif np.unique(y[train]).size < 2:
+            status = 'single_class_training'
+        windows.append(WalkForwardWindow(year, status, test, train, test_start))
+    return windows
+
+
+def walk_forward_validation(long_panel: pd.DataFrame, feature_cols: Sequence[str],
+                            scoring_date: pd.Timestamp, settings: Dict[str, Any]) -> ValidationResult:
+    """
+    Validates the pooled model with yearly walk-forward refits.
+
+    The test years are the `validation_years` calendar years ending with the year of
+    the scoring date; the current year is a partial block. A test row needs a known label
+    (label_end <= scoring_date). For each year, the model is refitted on the rows with a
+    known label, label_end before the year's first test date, a date before it and a date
+    within `model_history_years` of it, so no training label overlaps the test period.
+    A year without training or test rows is skipped and recorded with a status.
+
+    Args:
+        long_panel (pd.DataFrame): Month-end rows indexed by (date, ticker) with the rank
+            columns, fwd, label_end and y.
+        feature_cols (Sequence[str]): Rank columns used as model inputs.
+        scoring_date (pd.Timestamp): Last date of the union calendar.
+        settings (Dict[str, Any]): Loaded settings.
+
+    Returns:
+        ValidationResult: Per-year metrics (coefficients keyed by feature name), overall
+        metrics with the bootstrap CI, and the per-date table.
+    """
+    scoring_date = pd.Timestamp(scoring_date)
+    up_share = float(settings['up_share'])
+    min_etfs = int(settings['min_etfs_per_date'])
+    cols = list(feature_cols)
+    names = [_feature_name(col) for col in cols]
+
+    dates = pd.DatetimeIndex(long_panel.index.get_level_values('date'))
+    label_end = long_panel['label_end'].to_numpy(dtype='datetime64[ns]')
+    y = long_panel['y'].to_numpy(dtype=float)
+    X = long_panel[cols].to_numpy(dtype=float)
+
+    years: List[Dict[str, Any]] = []
+    tables: List[pd.DataFrame] = []
+    pooled_top_hits, pooled_top_rows, pooled_y_sum, pooled_rows = 0.0, 0, 0.0, 0
+    for window in walk_forward_windows(dates, label_end, y, scoring_date, int(settings['validation_years']),
+                                       int(settings['model_history_years'])):
+        year, test, train, test_start = window.year, window.test, window.train, window.test_start
+        if window.status != 'ok':
+            years.append({'year': year, 'status': window.status})
+            continue
+
+        model = fit_pooled_model(X[train], y[train], settings)
+        p_train = predict_probability(model, X[train])
+        p_test = predict_probability(model, X[test])
+        scored = long_panel.loc[test, ['y', 'fwd']].copy()
+        scored['probability'] = p_test
+        table = per_date_table(scored, year, up_share, min_etfs)
+        tables.append(table)
+
+        y_test = y[test]
+        top_rows = int(table['n_top'].sum())
+        top_hits = float((table['top_hit_rate'] * table['n_top']).sum())
+        pooled_top_hits += top_hits
+        pooled_top_rows += top_rows
+        pooled_y_sum += float(y_test.sum())
+        pooled_rows += int(y_test.size)
+        train_dates = dates[train]
+        years.append({
+            'year': year, 'status': 'ok',
+            'n_train': int(train.sum()), 'n_train_dates': int(train_dates.nunique()),
+            'train_first': _iso(train_dates.min()), 'train_last': _iso(train_dates.max()),
+            'max_label_end': _iso(pd.Timestamp(label_end[train].max())),
+            'test_start': _iso(test_start),
+            'n_test': int(test.sum()), 'n_test_dates': int(table.shape[0]),
+            'n_auc_dates': int(table['auc'].notna().sum()),
+            'auc_mean': _num(_mean(table['auc'])),
+            'is_auc': _num(roc_auc_score(y[train], p_train)),
+            'oos_auc': _num(roc_auc_score(y_test, p_test)) if np.unique(y_test).size > 1 else None,
+            'top_hit_rate': _num(top_hits / top_rows) if top_rows else None,
+            'base_rate': _num(y_test.mean()),
+            'top_minus_universe_fwd': _num(_mean(table['top_minus_universe_fwd'])),
+            'intercept': _num(model.intercept_[0]),
+            'coefficients': {name: _num(coef) for name, coef in zip(names, model.coef_[0])},
+        })
+        logger.info(f"Validation {year}: {years[-1]['n_train']} training rows, {years[-1]['n_test_dates']} test dates, "
+                    f"mean per-date AUC {years[-1]['auc_mean']}")
+
+    per_date = (pd.concat(tables, ignore_index=True) if tables
+                else pd.DataFrame(columns=PER_DATE_COLUMNS)).sort_values('date').reset_index(drop=True)
+    auc_series = per_date['auc'].to_numpy(dtype=float)
+    ci = block_bootstrap_ci(auc_series, int(settings['bootstrap_block_months']),
+                            int(settings['bootstrap_replications']), int(settings['bootstrap_seed']))
+    valid_auc = auc_series[np.isfinite(auc_series)]
+    fitted = [entry for entry in years if entry['status'] == 'ok']
+    ci_bounds = [_num(ci['ci_lower']), _num(ci['ci_upper'])]
+    overall = {
+        'auc_mean': _num(ci['mean']),
+        'auc_ci': ci_bounds if all(b is not None for b in ci_bounds) else None,
+        'n_dates': int(valid_auc.size),
+        'share_dates_above_half': _num((valid_auc > 0.5).mean()) if valid_auc.size else None,
+        'top_hit_rate': _num(pooled_top_hits / pooled_top_rows) if pooled_top_rows else None,
+        'base_rate': _num(pooled_y_sum / pooled_rows) if pooled_rows else None,
+        'top_minus_universe_fwd': _num(_mean(per_date['top_minus_universe_fwd'])),
+        'is_auc_mean': _num(_mean([entry['is_auc'] for entry in fitted if entry['is_auc'] is not None])),
+        'oos_auc_mean': _num(_mean([entry['oos_auc'] for entry in fitted if entry['oos_auc'] is not None])),
+        'n_years_fitted': len(fitted),
+        'n_test_rows': pooled_rows,
+    }
+    return ValidationResult(years=years, overall=overall, per_date=per_date)
+
+
+def evaluate_gate(validation: ValidationResult, settings: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Applies the model gate: the lower bound of the bootstrap CI of the mean per-date AUC
+    must exceed `min_validation_auc_lower`.
+
+    Args:
+        validation (ValidationResult): The walk-forward validation.
+        settings (Dict[str, Any]): Loaded settings.
+
+    Returns:
+        Dict[str, Any]: passed, ci_lower, threshold and reason (None if passed).
+    """
+    threshold = float(settings['min_validation_auc_lower'])
+    ci = validation.overall.get('auc_ci')
+    if not ci or ci[0] is None:
+        return {'passed': False, 'ci_lower': None, 'threshold': threshold, 'reason': GATE_INSUFFICIENT_DATES}
+    passed = bool(ci[0] > threshold)
+    return {'passed': passed, 'ci_lower': ci[0], 'threshold': threshold, 'reason': None if passed else GATE_LOW_AUC}
+
+
+def score_cross_section(model: LogisticRegression, cross_section: pd.DataFrame, settings: Dict[str, Any],
+                        gate_passed: bool) -> pd.DataFrame:
+    """
+    Scores and ranks the eligible ETFs of the scoring date.
+
+    Args:
+        model (LogisticRegression): The final model.
+        cross_section (pd.DataFrame): Eligible rows of the scoring date, indexed by ticker
+            or by (date, ticker), with the rank columns of `champion_features`.
+        settings (Dict[str, Any]): Loaded settings (champion_features, up_share).
+        gate_passed (bool): Result of the model gate; if False, no ETF is UP.
+
+    Returns:
+        pd.DataFrame: Indexed by ticker with probability, rank (1 = highest probability,
+        ties by ticker), n_ranked, top_percent (100 * rank / n_ranked) and predicted_class.
+    """
+    frame = cross_section
+    if isinstance(frame.index, pd.MultiIndex):
+        frame = frame.droplevel('date')
+    cols = rank_columns(settings['champion_features'])
+    columns = ['probability', 'rank', 'n_ranked', 'top_percent', 'predicted_class']
+    if frame.empty:
+        return pd.DataFrame(columns=columns, index=pd.Index([], name='ticker'))
+    probability = pd.Series(predict_probability(model, frame[cols]), index=frame.index)
+    ranks = rank_by_probability(probability)
+    n_ranked = len(frame)
+    n_up = n_up_for(n_ranked, float(settings['up_share']))
+    scored = pd.DataFrame({
+        'probability': probability, 'rank': ranks, 'n_ranked': n_ranked,
+        'top_percent': 100.0 * ranks / n_ranked,
+        'predicted_class': np.where(gate_passed & (ranks.to_numpy() <= n_up), CLASS_UP, CLASS_NOT_UP),
+    }, index=frame.index)
+    scored.index.name = 'ticker'
+    return scored
+
+
+def not_eligible_reasons(feature_panel: FeaturePanel, date: pd.Timestamp, min_price: float,
+                         min_history_days: int) -> pd.Series:
+    """
+    Explains why ETFs are not eligible on a date.
+
+    Args:
+        feature_panel (FeaturePanel): The aligned frames.
+        date (pd.Timestamp): The date (normally the scoring date).
+        min_price (float): `min_price_eur`.
+        min_history_days (int): `min_history_days`.
+
+    Returns:
+        pd.Series: Reason per ticker (one of INELIGIBLE_REASONS; if several apply, the
+        first in that order), None for eligible ETFs. `insufficient_history` means fewer
+        than `min_history_days` own trading days up to the date.
+    """
+    price = feature_panel.price.loc[date]
+    traded_value = feature_panel.traded_value.loc[date]
+    history = feature_panel.history_days.loc[date].to_numpy(dtype=float)
+    reasons = pd.Series(None, index=feature_panel.price.columns, dtype=object)
+    tv = traded_value.to_numpy(dtype=float)
+    masks = {
+        'stale_price': price.isna().to_numpy(),
+        'insufficient_history': ~(np.nan_to_num(history, nan=0.0) >= min_history_days),
+        'price_at_or_below_min': (price <= min_price).to_numpy(),
+        'no_traded_value': ~(np.isfinite(tv) & (np.nan_to_num(tv, nan=-1.0) > 0)),
+    }
+    eligible = feature_panel.eligible.loc[date].to_numpy()
+    # Assigned in reverse order, so the first applicable reason of INELIGIBLE_REASONS remains
+    for reason in reversed(INELIGIBLE_REASONS):
+        reasons[masks[reason] & ~eligible] = reason
+    reasons[eligible] = None
+    return reasons
+
+
+
+
+@dataclass
+class ModelResult:
+    """
+    Result of the pooled model.
+
+    Attributes:
+        results (pd.DataFrame): One row per ETF with price data, indexed by ticker:
+            latest_price, status, predicted_class, probability, rank, top_percent, the
+            raw features and the rank columns r_<feature> on the scoring date.
+        summary (Dict[str, Any]): The model summary (report key `model`).
+        validation (ValidationResult): The walk-forward validation.
+    """
+    results: pd.DataFrame
+    summary: Dict[str, Any]
+    validation: ValidationResult
+
+    @property
+    def feature_names(self) -> List[str]:
+        """The model features."""
+        return list(self.summary['features'])
+
+    @property
+    def up_tickers(self) -> List[str]:
+        """ETFs predicted Up, sorted."""
+        return sorted(self.results.index[self.results['predicted_class'] == CLASS_UP])
+
+
+def run_pooled_model(price_panel: PricePanel, settings: Dict[str, Any]) -> ModelResult:
+    """
+    Runs the pooled model: features, month-end panel, walk-forward validation, gate,
+    final fit and scoring of the last closed trading day.
+
+    If no final model can be fitted (no training rows, or a single class), the gate fails
+    with that reason and nothing is ranked: n_ranked and n_up are 0, and the eligible
+    ETFs carry the status model_gate_failed with null scores.
+
+    Args:
+        price_panel (PricePanel): Prices and volumes of the universe, the market index and
+            the macro factors.
+        settings (Dict[str, Any]): Loaded settings.
+
+    Returns:
+        ModelResult: Per-ETF results, model summary and validation.
+
+    Raises:
+        ValueError: If the panel holds no prices, the feature list is invalid, or the list
+            has market-relative or macro exposure features whose inputs are missing.
+    """
+    feature_names = validate_feature_names(settings['champion_features'])
+    feature_panel = build_feature_panel(price_panel, feature_names, settings)
+    if feature_panel.price.empty or len(feature_panel.calendar) == 0:
+        raise ValueError("The price panel contains no prices; the pooled model cannot run.")
+    cols = rank_columns(feature_names)
+    calendar = feature_panel.calendar
+    scoring_date = calendar[-1]
+    history = pd.DateOffset(years=int(settings['model_history_years']))
+    up_share = float(settings['up_share'])
+    min_price = float(settings['min_price_eur'])
+    min_history_days = int(settings['min_history_days'])
+
+    panel = to_long_panel(feature_panel, month_end_dates(calendar), settings)
+    validation = walk_forward_validation(panel, cols, scoring_date, settings)
+    gate = evaluate_gate(validation, settings)
+
+    dates = pd.DatetimeIndex(panel.index.get_level_values('date'))
+    label_end = panel['label_end'].to_numpy(dtype='datetime64[ns]')
+    train = (panel['y'].notna().to_numpy() & (label_end < np.datetime64(scoring_date))
+             & np.asarray(dates < scoring_date) & np.asarray(dates >= scoring_date - history))
+    model: Optional[LogisticRegression] = None
+    if not train.any():
+        gate = {**gate, 'passed': False, 'reason': GATE_NO_TRAINING_ROWS}
+    elif panel.loc[train, 'y'].nunique() < 2:
+        gate = {**gate, 'passed': False, 'reason': GATE_SINGLE_CLASS_TRAINING}
     else:
-        prediction = 0 # Default zu Flat
-    # --------------------------------------
+        model = fit_pooled_model(panel.loc[train, cols], panel.loc[train, 'y'], settings)
+    if gate['passed']:
+        logger.info(f"Model gate passed: lower CI bound {gate['ci_lower']:.4f} > {gate['threshold']}.")
+    else:
+        logger.warning(f"Model gate failed ({gate['reason']}); no ETF is Up today.")
 
-    class_mapping = {-1: "Down", 0: "Flat", 1: "Up"}
-    pred_label = class_mapping.get(prediction, "Unknown")
-    
-    predict_date = latest_features_scaled.index[0]
-    predict_date_str = predict_date.strftime('%Y-%m-%d') if isinstance(predict_date, pd.Timestamp) else str(predict_date)
-    
-    prob_flat = prob_dict.get(0, 0)
+    cross_section = to_long_panel(feature_panel, [scoring_date], settings).droplevel('date')
+    if model is not None:
+        scored = score_cross_section(model, cross_section, settings, gate['passed'])
+        n_ranked = int(len(cross_section))
+    else:
+        # Without a final model no ETF is scored or ranked; the eligible ETFs keep null scores
+        scored = pd.DataFrame(index=cross_section.index, columns=['probability', 'rank', 'top_percent'],
+                              dtype=float).assign(predicted_class=CLASS_NOT_UP)
+        n_ranked = 0
+    n_up = n_up_for(n_ranked, up_share)
 
-    print("\n" + "="*35)
-    print("=== Current Model Forecast ===")
-    print("="*35)
-    print(f"Date: {predict_date_str}")
-    print(f"Forecast: {pred_label}")
-    print(f"Probabilities: Down={prob_down:.2%}, Flat={prob_flat:.2%}, Up={prob_up:.2%}\n")
+    tickers = feature_panel.tickers
+    results = pd.DataFrame(index=pd.Index(tickers, name='ticker'))
+    results['latest_price'] = price_panel.close.reindex(columns=tickers).ffill().iloc[-1]
+    reasons = not_eligible_reasons(feature_panel, scoring_date, min_price, min_history_days)
+    eligible_status = STATUS_OK if gate['passed'] else STATUS_GATE_FAILED
+    results['status'] = [f"{NOT_ELIGIBLE}: {reasons[t]}" if reasons[t] else eligible_status for t in tickers]
+    results['predicted_class'] = scored['predicted_class'].reindex(tickers).fillna(CLASS_NOT_UP)
+    for col in ('probability', 'rank', 'top_percent'):
+        results[col] = pd.to_numeric(scored[col].reindex(tickers), errors='coerce')
+    for name, rank_col in zip(feature_names, cols):
+        results[name] = feature_panel.features[name].loc[scoring_date].reindex(tickers)
+        results[rank_col] = cross_section[rank_col].reindex(tickers)
 
-    # IMPORTANT: Calculation of feature weights for export
-    importance = np.mean(np.abs(model.coef_), axis=0)
-    feature_names = selected_features.tolist()
-    feature_weights = {feat: float(weight) for feat, weight in zip(feature_names, importance)}
-    
-    coeff_df = pd.DataFrame({
-        'Predictor': selected_features,
-        'Influence (Mean Absolute)': importance
-    }).sort_values(by='Influence (Mean Absolute)', ascending=False)
-    
-    if timestamp:
-        print(f"    [{datetime.now().strftime('%H:%M:%S')}] MODELING: Fetching economic interpretation from LLM...")
-        llm_analysis = get_llm_interpretation(coeff_df.to_string(index=False), target_etf, horizon)
-        
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.abspath(os.path.join(current_dir, '..'))
-        output_dir = os.path.join(project_root, 'output')
-        os.makedirs(output_dir, exist_ok=True)
-        
-        md_path = os.path.join(output_dir, f"feature_selection_{timestamp}.md")
-        with open(md_path, 'w', encoding='utf-8') as f:
-            f.write("# ETF Predictor Pipeline-Report\n\n")
-            f.write(f"- **Generated at:** {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"- **Target ETF:** {target_etf}\n")
-            f.write(f"- **Forecast Horizon:** {horizon} Trading Days\n\n")
-            
-            f.write("## Current Market Forecast (Predict)\n\n")
-            f.write(f"Based on closing prices from **{predict_date_str}**, the model predicts:\n\n")
-            f.write(f"> **Class:** {pred_label}\n>\n")
-            f.write(f"> **Probabilities:** Down: {prob_down:.2%} | Flat: {prob_flat:.2%} | Up: {prob_up:.2%}\n\n")
-            f.write("---\n\n")
-            
-            f.write("## Selected Predictors (SFS)\n\n")
-            f.write("| Predictor | Influence (Mean Absolute) |\n")
-            f.write("| :--- | :--- |\n")
-            for _, row in coeff_df.iterrows():
-                f.write(f"| {row['Predictor']} | {row['Influence (Mean Absolute)']:.6f} |\n")
-            f.write("\n")
-            
-            f.write("## Discarded Predictors\n\n")
-            f.write("### 1. Discarded in final selection (SFS Rejects)\n")
-            f.write(f"`{', '.join(rejected_stage_2.tolist())}`\n\n")
-            
-            f.write("### 2. Discarded in base filter (ANOVA Rejects)\n")
-            f.write(f"<details>\n<summary>Click to view all <b>{len(rejected_stage_1)}</b> variables discarded in stage 1</summary>\n\n")
-            f.write(f"`{', '.join(rejected_stage_1.tolist())}`\n")
-            f.write("\n</details>\n\n")
-            f.write("---\n\n")
-            
-            f.write("## AI Interpretation of Predictors (Hedge Fund Analyst)\n\n")
-            f.write(llm_analysis + "\n\n")
-            
-            f.write("## Mathematical Model Parameters\n\n")
-            f.write(f"- **Intercepts:** `{model.intercept_.tolist()}`\n\n")
-            f.write("- **Coefficient Matrix:**\n")
-            f.write("  ```text\n")
-            f.write(str(model.coef_))
-            f.write("\n  ```\n")
-            
-        try:
-            generate_variable_audit_table(
-                X_columns=X_scaled.columns, 
-                p_values=kbest.pvalues_, 
-                selected_features=selected_features, 
-                rejected_stage_2=rejected_stage_2, 
-                model_coefs=model.coef_,
-                timestamp=timestamp
-            )
-        except Exception as e:
-            print(f"Error during audit generation: {e}")
-            
+    coefficients = ({name: _num(coef) for name, coef in zip(feature_names, model.coef_[0])}
+                    if model is not None else {})
+    train_dates = dates[train]
+    not_eligible_counts = reasons.value_counts()
+    summary = {
+        'model': MODEL_NAME,
+        'scoring_date': _iso(scoring_date),
+        'features': feature_names,
+        'features_adopted': str(settings.get('champion_adopted')),
+        'coefficients': coefficients,
+        'intercept': _num(model.intercept_[0]) if model is not None else None,
+        'training': {
+            'n_rows': int(train.sum()), 'n_dates': int(train_dates.nunique()),
+            'first_date': _iso(train_dates.min()) if train.any() else None,
+            'last_date': _iso(train_dates.max()) if train.any() else None,
+            'max_label_end': _iso(pd.Timestamp(label_end[train].max())) if train.any() else None,
+        },
+        'cross_section': {
+            'n_universe': len(tickers), 'n_ranked': n_ranked, 'n_up': n_up, 'up_share': up_share,
+            'n_predicted_up': int((results['predicted_class'] == CLASS_UP).sum()),
+            'not_eligible': {reason: int(not_eligible_counts.get(reason, 0)) for reason in INELIGIBLE_REASONS},
+            'no_price_data': sorted(price_panel.missing),
+        },
+        'validation': {'years': validation.years, **validation.overall},
+        'gate': gate,
+        'parameters': {key: settings[key] for key in SUMMARY_PARAMETER_KEYS if key in settings},
+    }
+    logger.info(f"Pooled model scored {n_ranked} of {len(tickers)} ETFs on {summary['scoring_date']}; "
+                f"{summary['cross_section']['n_predicted_up']} Up (top {n_up}), validation AUC "
+                f"{validation.overall['auc_mean']} CI {validation.overall['auc_ci']}.")
+    return ModelResult(results=results, summary=summary, validation=validation)
+
+
+def etf_prediction(result: ModelResult, ticker: str) -> Dict[str, Any]:
+    """
+    Builds the entry of one ETF in the batch report.
+
+    Model-level metrics (validation, gate, coefficients) are not repeated here; they are
+    published once in the report key `model`.
+
+    Args:
+        result (ModelResult): The pooled model result.
+        ticker (str): A ticker of `result.results`.
+
+    Returns:
+        Dict[str, Any]: ticker, status, prediction_class (1 for Up, 0 for Not Up),
+        prediction_label, probability, rank, n_ranked, top_percent, latest_price,
+        feature_values (raw values on the scoring date), feature_percentiles (0 to 100 within
+        the ranked ETFs) and logit_contributions (coefficient x rank value, the feature's
+        contribution to the log-odds relative to a median ETF). Scores, percentiles and
+        contributions are None for ETFs that are not ranked.
+    """
+    row = result.results.loc[ticker]
+    cross = result.summary['cross_section']
+    ranked = pd.notna(row['rank'])
+    names = result.feature_names
+    percentiles: Optional[Dict[str, Optional[float]]] = None
+    contributions: Optional[Dict[str, Optional[float]]] = None
+    if ranked:
+        percentiles = {name: _num((row[f"{RANK_PREFIX}{name}"] + 0.5) * 100.0, 2) for name in names}
+        coefficients = result.summary['coefficients']
+        contributions = {name: _num(coefficients.get(name, float('nan')) * row[f"{RANK_PREFIX}{name}"], 4)
+                         for name in names}
+    label = str(row['predicted_class'])
     return {
-        "model": model,
-        "X_optimal": X_optimal,
-        "prediction": prediction,
-        "probabilities": prob_dict,
-        "cm_fig_train": fig_cm_train,
-        "cm_fig_cv": fig_cm_cv,
-        "cv_accuracy": cv_accuracy,
-        "is_valid_quality": is_valid_quality,
-        "ks_cutoff": optimal_down_threshold,
-        "selected_features": feature_names,
-        "feature_weights": feature_weights
+        'ticker': ticker,
+        'status': str(row['status']),
+        'prediction_class': 1 if label == CLASS_UP else 0,
+        'prediction_label': label,
+        'probability': _num(row['probability'], 6) if ranked else None,
+        'rank': int(row['rank']) if ranked else None,
+        'n_ranked': int(cross['n_ranked']),
+        'top_percent': _num(row['top_percent'], 2) if ranked else None,
+        'latest_price': _num(row['latest_price'], 4),
+        'feature_values': {name: _num(row[name]) for name in names},
+        'feature_percentiles': percentiles,
+        'logit_contributions': contributions,
     }

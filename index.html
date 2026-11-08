@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ETF Batch Analysis</title>
+    <title>ETF Ranking</title>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
         :root {
@@ -174,7 +174,7 @@
 
     <div class="container">
         <div class="header">
-            <h1>ETF Predictor</h1>
+            <h1>ETF Ranking</h1>
             <p id="execution-time">Loading data...</p>
             <p id="baseline-params"></p>
             <hr class="dashed">
@@ -183,23 +183,21 @@
         <div id="error-msg" style="display: none;"></div>
 
         <div class="info-box">
-            <h4>[ Dual-Cutoff Decision Logic ]</h4>
+            <h4>[ Decision Logic ]</h4>
             <ul>
-                <li>1. Down_prob (Prio 1): If the Prob Down exceeds the KS Cutoff, the signal is set to [ DOWN ].</li>
-                <li>2. Up_prob (Prio 2): If the risk is low, the Prob Up must clear a hard hurdle (e.g., 65%) to
-                    generate an [ UP ] signal.</li>
-                <li>3. Flat_prob: If neither rule applies, the model is undecided and declares the market as [ FLAT ].
-                </li>
+                <li>1. One pooled logistic regression estimates, for every ETF, the probability of a gain of at least
+                    the threshold over the horizon. Its inputs are the ETFs' features ranked against each other on the
+                    same date.</li>
+                <li>2. The ETFs are ranked by that probability. The top share of the ranking is [ Up ], all others
+                    are [ Not Up ].</li>
+                <li>3. Model gate: if the lower bound of the 95% interval of the walk-forward validation AUC is not
+                    above the threshold, no ETF is [ Up ].</li>
             </ul>
         </div>
 
         <div id="top-etfs-container" style="display: none; margin-bottom: 20px;">
             <div class="info-box">
-                <h4>[ Recommended Top ETFs ]</h4>
-                <p>
-                    These ETFs are classified as UP by the model, have a model accuracy (CV Accuracy) of over 65%, and
-                    an UP probability below 90% (to exclude potentially faulty or overfitted classifications).
-                </p>
+                <h4>[ Up: Top of the Ranking ]</h4>
                 <div id="top-etfs-list" style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
                     <!-- Dynamically populated -->
                 </div>
@@ -208,29 +206,33 @@
 
         <div class="metrics-grid">
             <div class="metric-card">
-                <h3>Valid ETFs</h3>
-                <div class="metric-value" id="kpi-total">-</div>
+                <h3>Ranked ETFs</h3>
+                <div class="metric-value" id="kpi-ranked">-</div>
             </div>
             <div class="metric-card">
                 <h3>Forecast: Up</h3>
                 <div class="metric-value" id="kpi-up">-</div>
             </div>
             <div class="metric-card">
-                <h3>Forecast: Down</h3>
-                <div class="metric-value" id="kpi-down">-</div>
+                <h3>Validation AUC</h3>
+                <div class="metric-value" id="kpi-auc">-</div>
             </div>
             <div class="metric-card">
-                <h3>Forecast: Flat</h3>
-                <div class="metric-value" id="kpi-flat">-</div>
+                <h3>Model Gate</h3>
+                <div class="metric-value" id="kpi-gate">-</div>
+            </div>
+            <div class="metric-card">
+                <h3>Top-Share Hit Rate</h3>
+                <div class="metric-value" id="kpi-hit">-</div>
             </div>
         </div>
 
         <div class="chart-container">
-            <div id="scatter-plot" style="width: 100%; height: 500px;"></div>
+            <div id="auc-plot" style="width: 100%; min-height: 60px;"></div>
         </div>
 
         <div class="flex-header">
-            <h3 style="margin: 0;">[ All Results ]</h3>
+            <h3 style="margin: 0;">[ Ranking ]</h3>
             <input type="text" id="filter-input" placeholder="Search ticker or forecast..."
                 onkeyup="applyFilterAndSort()">
         </div>
@@ -239,15 +241,15 @@
             <table id="data-table">
                 <thead>
                     <tr>
+                        <th onclick="handleSort('rank')">Rank <span id="sort-icon-rank">↕</span></th>
                         <th onclick="handleSort('ticker')">Ticker <span id="sort-icon-ticker">↕</span></th>
                         <th onclick="handleSort('prediction_label')">Forecast <span
                                 id="sort-icon-prediction_label">↕</span></th>
-                        <th onclick="handleSort('prob_up')">Prob Up <span id="sort-icon-prob_up">↕</span></th>
-                        <th onclick="handleSort('prob_flat')">Prob Flat <span id="sort-icon-prob_flat">↕</span></th>
-                        <th onclick="handleSort('prob_down')">Prob Down <span id="sort-icon-prob_down">↕</span></th>
-                        <th onclick="handleSort('cv_accuracy')">CV Accuracy <span id="sort-icon-cv_accuracy">↕</span>
-                        </th>
-                        <th onclick="handleSort('ks_cutoff')">KS Cutoff <span id="sort-icon-ks_cutoff">↕</span></th>
+                        <th onclick="handleSort('probability')">Probability <span
+                                id="sort-icon-probability">↕</span></th>
+                        <th onclick="handleSort('top_percent')">Top % <span id="sort-icon-top_percent">↕</span></th>
+                        <th onclick="handleSort('latest_price')">Price <span id="sort-icon-latest_price">↕</span></th>
+                        <th onclick="handleSort('status')">Status <span id="sort-icon-status">↕</span></th>
                     </tr>
                 </thead>
                 <tbody id="table-body">
@@ -258,132 +260,120 @@
 
     <script>
         const JSON_URL = 'artifacts/latest_batch_results.json';
+        const COLUMNS = ['rank', 'ticker', 'prediction_label', 'probability', 'top_percent', 'latest_price', 'status'];
 
-        let globalValidData = [];
-        let currentSortCol = 'cv_accuracy';
-        let currentSortAsc = false;
+        let allResults = [];
+        let currentSortCol = 'rank';
+        let currentSortAsc = true;
+
+        function pct(value, digits = 1) {
+            return (value === null || value === undefined) ? '-' : `${(value * 100).toFixed(digits)}%`;
+        }
+
+        function num(value, digits = 3) {
+            return (value === null || value === undefined) ? '-' : Number(value).toFixed(digits);
+        }
+
+        function showError(message) {
+            const box = document.getElementById('error-msg');
+            box.style.display = 'block';
+            box.innerText = message;
+        }
 
         async function loadData() {
             try {
                 const response = await fetch(JSON_URL);
                 if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                const data = await response.json();
 
-                const rawText = await response.text();
+                if (!data.model || !Array.isArray(data.results)) {
+                    showError('The batch results use an earlier format. Run the workflow "Pipeline: 2. Run Batch" to create them with the pooled model.');
+                    document.getElementById('execution-time').innerText = '';
+                    return;
+                }
 
-                const cleanText = rawText
-                    .replace(/:\s*Infinity/g, ': "Infinity"')
-                    .replace(/:\s*-Infinity/g, ': "-Infinity"')
-                    .replace(/:\s*NaN/g, ': "NaN"');
+                document.getElementById('execution-time').innerText =
+                    `Last batch run: ${data.execution_time} | Scoring date: ${data.scoring_date}`;
+                const cross = data.model.cross_section;
+                document.getElementById('baseline-params').innerText =
+                    `Target: gain of at least ${pct(data.target.threshold, 1)} over ${data.target.horizon_days} trading days | ` +
+                    `Up: top ${pct(cross.up_share, 0)} of the ranking | ` +
+                    `Features (adopted ${data.model.features_adopted}): ${data.model.features.join(', ')}`;
 
-                const data = JSON.parse(cleanText);
-
-                if (data.execution_time) {
-                    document.getElementById('execution-time').innerText = `Last Batch-Run: ${data.execution_time}`;
+                renderModel(data.model);
+                allResults = data.results;
+                renderTopEtfs(allResults);
+                applyFilterAndSort();
+                // The chart library comes from a CDN; the figures above do not depend on it
+                if (typeof Plotly === 'undefined') {
+                    document.getElementById('auc-plot').innerText =
+                        'The chart library (cdn.plot.ly) could not be loaded; the validation chart is not shown.';
                 } else {
-                    document.getElementById('execution-time').innerText = `Successfully loaded`;
+                    renderAucPlot(data.validation_per_date || []);
                 }
-
-                if (data.baseline_parameters) {
-                    document.getElementById('baseline-params').innerHTML =
-                        `Parameters: Inflation: ${(data.baseline_parameters.annual_inflation_rate * 100).toFixed(1)}% | ` +
-                        `Margin Up: ${(data.baseline_parameters.annual_margin_up * 100).toFixed(1)}% | ` +
-                        `Margin Down: ${(data.baseline_parameters.annual_margin_down * 100).toFixed(1)}%`;
-                }
-
-                processAndRender(data.results);
             } catch (error) {
                 console.error("Error loading or parsing JSON:", error);
-                document.getElementById('error-msg').style.display = 'block';
-                document.getElementById('error-msg').innerText = `Error loading or parsing data. See Console (F12) for details.`;
+                showError('Error loading or parsing data. See Console (F12) for details.');
             }
         }
 
-        function processAndRender(results) {
-            globalValidData = results.filter(item => {
-                const isQualityPassed = item.quality_gate_passed === true;
-                const isKsValid = item.ks_cutoff !== "Infinity" && item.ks_cutoff !== null && !isNaN(item.ks_cutoff);
-                return isQualityPassed && isKsValid;
-            });
-
-            const validData = globalValidData;
-
-            let countUp = 0, countDown = 0, countFlat = 0;
-            validData.forEach(item => {
-                if (item.prediction_label === "Up") countUp++;
-                else if (item.prediction_label === "Down") countDown++;
-                else if (item.prediction_label === "Flat") countFlat++;
-            });
-
-            document.getElementById('kpi-total').innerText = validData.length;
-            document.getElementById('kpi-up').innerText = countUp;
-            document.getElementById('kpi-down').innerText = countDown;
-            document.getElementById('kpi-flat').innerText = countFlat;
-
-            renderPlot(validData);
-            renderTopEtfs(validData);
-            applyFilterAndSort();
+        function renderModel(model) {
+            const validation = model.validation;
+            const gate = model.gate;
+            document.getElementById('kpi-ranked').innerText = model.cross_section.n_ranked;
+            document.getElementById('kpi-up').innerText = model.cross_section.n_predicted_up;
+            const ci = validation.auc_ci ? ` [${num(validation.auc_ci[0])}, ${num(validation.auc_ci[1])}]` : '';
+            document.getElementById('kpi-auc').innerText = `${num(validation.auc_mean)}${ci}`;
+            document.getElementById('kpi-gate').innerText = gate.passed ? 'passed' : `failed (${gate.reason})`;
+            document.getElementById('kpi-hit').innerText =
+                `${pct(validation.top_hit_rate)} (base ${pct(validation.base_rate)})`;
         }
 
-        function renderPlot(data) {
-            const traceUp = { x: [], y: [], text: [], mode: 'markers', name: 'Up', marker: { color: '#ffffff', symbol: 'triangle-up-open', size: 10 } };
-            const traceDown = { x: [], y: [], text: [], mode: 'markers', name: 'Down', marker: { color: '#ffffff', symbol: 'triangle-down-open', size: 10 } };
-            const traceFlat = { x: [], y: [], text: [], mode: 'markers', name: 'Flat', marker: { color: '#ffffff', symbol: 'circle-open', size: 10 } };
-
-            data.forEach(item => {
-                const maxProb = Math.max(item.prob_up, item.prob_down, item.prob_flat);
-                const tooltip = `Ticker: ${item.ticker}<br>Accuracy: ${(item.cv_accuracy * 100).toFixed(1)}%<br>Signal: ${(maxProb * 100).toFixed(1)}%`;
-
-                if (item.prediction_label === "Up") {
-                    traceUp.x.push(item.cv_accuracy); traceUp.y.push(maxProb); traceUp.text.push(tooltip);
-                } else if (item.prediction_label === "Down") {
-                    traceDown.x.push(item.cv_accuracy); traceDown.y.push(maxProb); traceDown.text.push(tooltip);
-                } else {
-                    traceFlat.x.push(item.cv_accuracy); traceFlat.y.push(maxProb); traceFlat.text.push(tooltip);
-                }
-            });
-
+        function renderAucPlot(perDate) {
+            const dated = perDate.filter(row => row.auc !== null && row.auc !== undefined);
+            const trace = {
+                x: dated.map(row => row.date), y: dated.map(row => row.auc), mode: 'lines+markers',
+                name: 'Per-date AUC', line: { color: '#ffffff' }, marker: { color: '#ffffff', size: 5 }
+            };
+            const noSkill = {
+                x: dated.length ? [dated[0].date, dated[dated.length - 1].date] : [], y: [0.5, 0.5], mode: 'lines',
+                name: 'No skill (0.5)', line: { color: '#888888', dash: 'dash' }
+            };
             const layout = {
-                title: { text: 'Model Quality vs. Signal Strength', font: { color: '#fff', family: 'monospace' } },
-                xaxis: { title: { text: 'CV Accuracy', font: { color: '#fff', family: 'monospace' } }, tickformat: ',.0%', tickfont: { color: '#fff', family: 'monospace' }, gridcolor: '#444' },
-                yaxis: { title: { text: 'Maximum Probability', font: { color: '#fff', family: 'monospace' } }, tickformat: ',.0%', tickfont: { color: '#fff', family: 'monospace' }, gridcolor: '#444' },
+                title: { text: 'Walk-Forward Validation: Cross-Sectional AUC per Month-End', font: { color: '#fff', family: 'monospace' } },
+                xaxis: { tickfont: { color: '#fff', family: 'monospace' }, gridcolor: '#444' },
+                yaxis: { title: { text: 'AUC', font: { color: '#fff', family: 'monospace' } }, tickfont: { color: '#fff', family: 'monospace' }, gridcolor: '#444' },
                 hovermode: 'closest',
                 paper_bgcolor: '#000',
                 plot_bgcolor: '#000',
                 legend: { font: { color: '#fff', family: 'monospace' } },
                 margin: { l: 60, r: 20, t: 40, b: 50 }
             };
-
-            Plotly.newPlot('scatter-plot', [traceUp, traceDown, traceFlat], layout, { responsive: true });
+            document.getElementById('auc-plot').style.height = '420px';
+            Plotly.newPlot('auc-plot', [trace, noSkill], layout, { responsive: true });
         }
 
-        function renderTopEtfs(data) {
-            const topEtfs = data.filter(item =>
-                item.prediction_label === "Up" &&
-                item.cv_accuracy > 0.65 &&
-                item.prob_up < 0.90
-            );
-
-            topEtfs.sort((a, b) => b.prob_up - a.prob_up);
-
+        function renderTopEtfs(results) {
+            const upEtfs = results.filter(item => item.prediction_label === 'Up')
+                .sort((a, b) => a.rank - b.rank);
             const container = document.getElementById('top-etfs-container');
             const listContainer = document.getElementById('top-etfs-list');
-
-            if (topEtfs.length > 0) {
-                container.style.display = 'block';
-                listContainer.innerHTML = '';
-                topEtfs.forEach(item => {
-                    const etfCard = document.createElement('div');
-                    etfCard.style.cssText = 'border: 1px dashed #fff; padding: 10px; text-align: center; min-width: 120px;';
-                    etfCard.innerHTML = `
-                    <div style="font-weight: bold; font-size: 1.1em; margin-bottom: 5px;">${item.ticker}</div>
-                    <div>UP: ${(item.prob_up * 100).toFixed(1)}%</div>
-                    <div>CV Acc: ${(item.cv_accuracy * 100).toFixed(1)}%</div>
-                `;
-                    listContainer.appendChild(etfCard);
-                });
-            } else {
+            if (upEtfs.length === 0) {
                 container.style.display = 'none';
+                return;
             }
+            container.style.display = 'block';
+            listContainer.innerHTML = '';
+            upEtfs.forEach(item => {
+                const card = document.createElement('div');
+                card.style.cssText = 'border: 1px dashed #fff; padding: 10px; text-align: center; min-width: 120px;';
+                card.innerHTML = `
+                    <div style="font-weight: bold; font-size: 1.1em; margin-bottom: 5px;">${item.ticker}</div>
+                    <div>Rank ${item.rank} of ${item.n_ranked}</div>
+                    <div>P: ${pct(item.probability)}</div>
+                `;
+                listContainer.appendChild(card);
+            });
         }
 
         function handleSort(col) {
@@ -391,63 +381,51 @@
                 currentSortAsc = !currentSortAsc;
             } else {
                 currentSortCol = col;
-                currentSortAsc = false;
-                if (col === 'ticker' || col === 'prediction_label') {
-                    currentSortAsc = true;
-                }
+                currentSortAsc = ['rank', 'ticker', 'prediction_label', 'top_percent', 'status'].includes(col);
             }
             applyFilterAndSort();
         }
 
+        function compareValues(valA, valB) {
+            const missingA = valA === null || valA === undefined;
+            const missingB = valB === null || valB === undefined;
+            if (missingA || missingB) return missingA === missingB ? 0 : (missingA ? 1 : -1);
+            if (typeof valA === 'string') { valA = valA.toLowerCase(); valB = String(valB).toLowerCase(); }
+            if (valA < valB) return currentSortAsc ? -1 : 1;
+            if (valA > valB) return currentSortAsc ? 1 : -1;
+            return 0;
+        }
+
         function applyFilterAndSort() {
             const filterText = document.getElementById('filter-input').value.toLowerCase();
+            const filtered = allResults.filter(item =>
+                item.ticker.toLowerCase().includes(filterText) ||
+                item.prediction_label.toLowerCase().includes(filterText));
+            // Rows without a value stay at the end in both directions
+            filtered.sort((a, b) => compareValues(a[currentSortCol], b[currentSortCol]));
 
-            let filteredData = globalValidData.filter(item => {
-                return item.ticker.toLowerCase().includes(filterText) ||
-                    item.prediction_label.toLowerCase().includes(filterText);
-            });
-
-            filteredData.sort((a, b) => {
-                let valA = a[currentSortCol];
-                let valB = b[currentSortCol];
-
-                if (typeof valA === 'string') valA = valA.toLowerCase();
-                if (typeof valB === 'string') valB = valB.toLowerCase();
-
-                if (valA < valB) return currentSortAsc ? -1 : 1;
-                if (valA > valB) return currentSortAsc ? 1 : -1;
-                return 0;
-            });
-
-            const columns = ['ticker', 'prediction_label', 'prob_up', 'prob_flat', 'prob_down', 'cv_accuracy', 'ks_cutoff'];
-            columns.forEach(col => {
+            COLUMNS.forEach(col => {
                 const iconSpan = document.getElementById(`sort-icon-${col}`);
                 if (iconSpan) {
-                    if (col === currentSortCol) {
-                        iconSpan.innerHTML = currentSortAsc ? '↑' : '↓';
-                    } else {
-                        iconSpan.innerHTML = '↕';
-                    }
+                    iconSpan.innerHTML = col === currentSortCol ? (currentSortAsc ? '↑' : '↓') : '↕';
                 }
             });
-
-            renderTable(filteredData);
+            renderTable(filtered);
         }
 
         function renderTable(data) {
             const tbody = document.getElementById('table-body');
             tbody.innerHTML = '';
-
             data.forEach(item => {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
+                <td>${item.rank ?? '-'}</td>
                 <td><strong>${item.ticker}</strong></td>
                 <td><span class="badge">[ ${item.prediction_label} ]</span></td>
-                <td>${(item.prob_up * 100).toFixed(1)}%</td>
-                <td>${(item.prob_flat * 100).toFixed(1)}%</td>
-                <td>${(item.prob_down * 100).toFixed(1)}%</td>
-                <td>${(item.cv_accuracy * 100).toFixed(1)}%</td>
-                <td>${(item.ks_cutoff * 100).toFixed(1)}%</td>
+                <td>${pct(item.probability)}</td>
+                <td>${item.top_percent === null || item.top_percent === undefined ? '-' : item.top_percent.toFixed(1) + '%'}</td>
+                <td>${num(item.latest_price, 2)}</td>
+                <td>${item.status}</td>
             `;
                 tbody.appendChild(tr);
             });

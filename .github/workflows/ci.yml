@@ -30,8 +30,8 @@ jobs:
           version: "0.12.17"
           enable-cache: true
 
-      # The catalog updater and the Docker image install with `uv sync --frozen`, which
-      # silently installs the old versions if uv.lock does not match pyproject.toml
+      # The Docker image installs with `uv sync --frozen`, which silently installs the
+      # old versions if uv.lock does not match pyproject.toml
       - name: Verify uv.lock matches pyproject.toml
         run: uv lock --check
 

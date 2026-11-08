@@ -1,0 +1,110 @@
+# User-defined parameters of the ETF predictor. The Python modules read every parameter from
+# this file (src/config.py, load_settings()); they hold no thresholds of their own.
+
+# Target definition: an ETF is a positive case if its adjusted close `horizon_days` trading days later is at least
+# `threshold` above the current close (point to point)
+horizon_days: 126
+threshold: 0.10
+
+# Pooled model: one cross-sectional logistic regression for all ETFs (src/modeling.py)
+champion_features: [ret_21, ret_63, ret_126, mom_12_1, dist_sma50, dist_sma200, vol_21, vol_126, drawdown_252]  # each rank-transformed within each date
+champion_adopted: "2026-11-08"       # date on which champion_features was adopted (keep the quotes); later test dates are fresh evidence of the variable review, and the reviews after it count toward m_cum
+model_history_years: 10              # maximum training window of the final model and of each validation refit (the early refits get fewer years)
+feature_warmup_years: 2              # extra price history fetched before the training window; the 252-day features need one year, the 504-day candidates of the variable review two
+model_l2_c: 0.1                      # inverse L2 regularization strength of the logistic regression
+model_solver_tol: 1.0e-8             # convergence tolerance of the lbfgs solver
+model_max_iter: 1000                 # iteration limit of the lbfgs solver
+up_share: 0.10                       # share of the ranked ETFs marked Up on the scoring date
+min_price_eur: 1.0                   # eligibility: ETFs at or below this price are not ranked
+min_history_days: 253                # eligibility: ETFs with fewer own trading days up to the date are not ranked
+ffill_limit_days: 5                  # a day without a trade carries the ETF's last trading day for at most this many days
+validation_years: 8                  # calendar years of the walk-forward validation, ending with the year of the scoring date
+min_etfs_per_date: 30                # dates with fewer validation rows are left out of the per-date AUC
+bootstrap_block_months: 6            # block length (consecutive month-ends) of the moving-block bootstrap
+bootstrap_replications: 2000         # bootstrap replications of the mean per-date AUC
+bootstrap_seed: 0                    # random seed of the bootstrap
+min_validation_auc_lower: 0.5        # model gate: no ETF is Up unless the lower 95% CI bound of the validation AUC exceeds this value
+
+# Target universe (scripts/build_etf_batch.py writes config/batch_targets.json)
+min_years_history: 10                # minimum price history of a target ETF in years
+
+# Price download (src/prices.py)
+price_download_batch_size: 60        # tickers per yfinance batch request
+price_download_retries: 3            # re-downloads of the tickers that came back without data
+market_index_ticker: "EUNL.DE"       # market index of the market-relative features (iShares Core MSCI World, Xetra, EUR); a target ETF, so it is also ranked
+macro_factor_tickers:                # Yahoo Finance tickers of the macro factors of the family macro_exposure; the factor names and their transformations are fixed in src/features.py
+  eurusd: "EURUSD=X"                 # euro in US dollars (relative change)
+  us_10y: "^TNX"                     # US 10-year Treasury yield in percent (change in points)
+  oil: "BZ=F"                        # Brent crude oil future (relative change; the WTI future closed below zero in April 2020)
+  gold: "GC=F"                       # gold future (relative change)
+  copper: "HG=F"                     # copper future (relative change)
+  credit: ["HYG", "LQD"]             # high-yield minus investment-grade corporate bond ETF (difference of the relative changes)
+  vix: "^VIX"                        # CBOE volatility index (change in points)
+  em_equity: "EEM"                   # emerging markets equity ETF (relative change)
+
+# Quarterly variable review: champion-challenger test of the feature set (scripts/review_variables.py)
+# Candidate pool of the variable review by family: every name must be a feature of the registry
+# (src/features.py) in that family; the order does not matter. Change the pool deliberately
+# before a review, not in response to its results.
+review_candidate_features:
+  returns: [ret_1, ret_5, ret_10, ret_21, ret_42, ret_63, ret_84, ret_126, ret_189, ret_252]
+  momentum: [mom_12_1, mom_12_2, mom_12_3, mom_9_1, mom_6_1, mom_3_1, mom_12_6, mom_24_12]
+  sma_distance: [dist_sma10, dist_sma20, dist_sma50, dist_sma100, dist_sma150, dist_sma200, dist_sma250]
+  sma_crossover: [sma5_sma20, sma10_sma20, sma10_sma50, sma20_sma50, sma20_sma100, sma50_sma200, sma20_sma200,
+                  sma100_sma200]
+  sma_slope: [sma20_chg_5, sma20_chg_21, sma50_chg_21, sma50_chg_63, sma100_chg_21, sma100_chg_63, sma200_chg_21,
+              sma200_chg_63]
+  highs_lows: [dist_high_10, dist_high_21, dist_high_63, dist_high_126, drawdown_252, dist_high_504, dist_low_10,
+               dist_low_21, dist_low_63, dist_low_126, dist_low_252, dist_low_504, range_pos_21, range_pos_63,
+               range_pos_126, range_pos_252, range_pos_504, days_since_high_63, days_since_high_126,
+               days_since_high_252, days_since_low_63, days_since_low_126, days_since_low_252, maxdd_63, maxdd_126,
+               maxdd_252, ulcer_63, ulcer_126, ulcer_252]
+  volatility: [vol_5, vol_10, vol_21, vol_42, vol_63, vol_126, vol_252, downvol_21, downvol_63, downvol_126,
+               downvol_252, upvol_21, upvol_63, upvol_126, upvol_252, vol_ratio_5_21, vol_ratio_5_63, vol_ratio_10_63,
+               vol_ratio_21_63, vol_ratio_21_126, vol_ratio_21_252, vol_ratio_63_252, vov_126, vov_252]
+  range_volatility: [parkinson_10, parkinson_21, parkinson_63, parkinson_126, garman_klass_10, garman_klass_21,
+                     garman_klass_63, garman_klass_126, hl_range_5, hl_range_10, hl_range_21, hl_range_63,
+                     hl_range_126]
+  higher_moments: [skew_21, skew_63, skew_126, skew_252, kurt_21, kurt_63, kurt_126, kurt_252, max_ret_5, max_ret_10,
+                   max_ret_21, max_ret_63, max_ret_126, max_ret_252, min_ret_5, min_ret_10, min_ret_21, min_ret_63,
+                   min_ret_126, min_ret_252]
+  market: [beta_63, beta_126, beta_252, beta_504, corr_63, corr_126, corr_252, idio_vol_21, idio_vol_63, idio_vol_126,
+           idio_vol_252, downbeta_126, downbeta_252, upbeta_126, upbeta_252, mkt_r2_63, mkt_r2_126, mkt_r2_252,
+           resid_mom_12_1, resid_mom_6_1, rel_ret_5, rel_ret_10, rel_ret_21, rel_ret_63, rel_ret_126, rel_ret_252]
+  liquidity: [log_tv_5, log_tv_10, log_tv_21, log_tv_63, log_traded_value, log_tv_252, amihud_10, amihud_21,
+              amihud_63, amihud_126, amihud_252, zero_ret_21, zero_ret_63, zero_ret_126, zero_ret_252, zero_vol_21,
+              zero_vol_63, zero_vol_126, zero_vol_252, vol_trend_5_21, vol_trend_5_63, vol_trend_21_63,
+              vol_trend_21_126, vol_trend_21_252, vol_trend_63_252, volume_cv_21, volume_cv_63, volume_cv_126]
+  trend_quality: [trend_r2_21, trend_r2_63, trend_r2_126, trend_r2_252, trend_t_21, trend_t_63, trend_t_126,
+                  trend_t_252, up_days_10, up_days_21, up_days_63, up_days_126, up_days_252, id_63, id_126, id_252,
+                  autocorr_21, autocorr_63, autocorr_126, autocorr_252]
+  overnight_intraday: [overnight_5, overnight_21, overnight_63, overnight_126, intraday_5, intraday_21, intraday_63,
+                       intraday_126]
+  oscillators: [rsi_7, rsi_14, rsi_21, rsi_28, stoch_k_14, stoch_k_28, stoch_d_14, williams_r_14, macd_line,
+                macd_signal, macd_hist, boll_b_20, boll_b_50, boll_width_20, boll_width_50, cci_20, cci_50, mfi_14,
+                mfi_28, cmf_21, cmf_63, obv_slope_21, obv_slope_63, obv_slope_126, adx_14, adx_28]
+  seasonality: [seas_1y, seas_2y]
+  macro_exposure: [beta_eurusd_126, beta_eurusd_252, beta_us_10y_126, beta_us_10y_252, beta_oil_126, beta_oil_252,
+                   beta_gold_126, beta_gold_252, beta_copper_126, beta_copper_252, beta_credit_126, beta_credit_252,
+                   beta_vix_126, beta_vix_252, beta_em_equity_126, beta_em_equity_252, expo_eurusd_21, expo_eurusd_63,
+                   expo_eurusd_126, expo_us_10y_21, expo_us_10y_63, expo_us_10y_126, expo_oil_21, expo_oil_63,
+                   expo_oil_126, expo_gold_21, expo_gold_63, expo_gold_126, expo_copper_21, expo_copper_63,
+                   expo_copper_126, expo_credit_21, expo_credit_63, expo_credit_126, expo_vix_21, expo_vix_63,
+                   expo_vix_126, expo_em_equity_21, expo_em_equity_63, expo_em_equity_126]
+review_validation_years: 8           # calendar years of the walk-forward comparison, ending with the year of the last trading day before the review date
+review_inner_splits: 3               # maximum number of inner validation blocks of a selection procedure
+review_inner_validation_months: 24   # month-ends per inner validation block; each block is preceded by a label-end purge
+review_inner_min_train_months: 12    # minimum number of inner training month-ends before the first inner validation block
+review_anova_k: 40                   # stepwise: candidates kept by the ANOVA prefilter, refitted in each inner training split
+review_stepwise_min_gain: 0.002      # stepwise: stop when no addition raises the inner mean per-date AUC by at least this
+review_max_features: 15              # stepwise: maximum number of selected features
+review_lasso_c_grid: [0.0003, 0.001, 0.003, 0.01, 0.03, 0.1]  # lasso: inverse L1 strengths, one is chosen on the inner splits
+review_lasso_max_features: 40        # lasso: if more coefficients are nonzero, the largest absolute ones are kept
+review_lasso_seed: 0                 # lasso: random_state of liblinear (coordinate order), fixed for reproducible selections
+review_fm_t_hurdle: 3.0              # fm_screen: minimum absolute Newey-West t-statistic of the mean rank correlation
+review_fm_nw_lag: 6                  # fm_screen: Newey-West lags in month-ends
+review_manual_sets: {}               # optional fixed challengers: name -> list of feature names
+review_auc_hurdle: 0.015             # switch rule (a): minimum historical mean AUC gain of a challenger over the champion
+review_family_alpha: 0.05            # switch rule (b): family error rate; the CI level is 1 - review_family_alpha / m_cum, the challenger comparisons since champion_adopted including this review
+review_min_winning_years: 6          # switch rule (c): minimum number of test years in which the mean per-date AUC gain is positive
+review_fresh_check_min_dates: 6      # switch rule (d): test dates after champion_adopted needed before the fresh evidence is checked
