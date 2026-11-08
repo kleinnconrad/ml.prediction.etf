@@ -38,8 +38,11 @@ def test_settings_contain_parameters_used_by_the_pipeline() -> None:
                 'bootstrap_block_months', 'bootstrap_replications', 'bootstrap_seed',
                 'min_validation_auc_lower', 'price_download_batch_size', 'price_download_retries',
                 'min_history_days', 'champion_adopted', 'market_index_ticker', 'macro_factor_tickers',
-                'min_years_history'):
+                'min_years_history', 'uplift_lookback_days', 'uplift_match_tolerance_days', 'history_retention_days'):
         assert key in settings
+    # The archive must outlast the longest uplift lookback, or that lookback never finds a report
+    longest = max(settings['uplift_lookback_days'].values()) + settings['uplift_match_tolerance_days']
+    assert settings['history_retention_days'] > longest
     assert all(key in settings for key in REVIEW_PARAMETER_KEYS)
     # Every summary key must exist, or the summary would silently lose it
     assert all(key in settings for key in SUMMARY_PARAMETER_KEYS)

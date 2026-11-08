@@ -50,7 +50,7 @@ This repository ranks Xetra-listed ETFs by their estimated probability of a gain
 ## Folder Structure
 
 - **`.github/`**: GitHub Actions workflows (seed update, batch run, quarterly variable review, pre-merge checks, release process) and the Dependabot configuration.
-- **`artifacts/`**: Persisted outputs: `latest_batch_results.json` (the batch report read by the dashboard) and `variable_reviews/` (the reports of the quarterly variable reviews). Older files come from the per-ETF models before release 2.0.0.
+- **`artifacts/`**: Persisted outputs: `latest_batch_results.json` (the batch report read by the dashboard), `history/` (a compact archive of every batch report), `uplift_report.json` (the realized returns of the archived predictions) and `variable_reviews/` (the reports of the quarterly variable reviews). Older files come from the per-ETF models before release 2.0.0.
 - **`config/`**: `settings.yaml` (all model, review and download parameters), the target list `batch_targets.json`, the ETF seed list and the Xetra T7 instrument dump.
 - **`devcontainer/`**: Configuration for reproducible development environments.
 - **`docs/`**: Supplementary documentation: feature engineering details and the GLM checklist.
@@ -203,7 +203,8 @@ The baseline review of 2026-11-08 kept the champion. Mean per-date AUC on 87 tes
 
 ## Expected Performance and Limitations
 
-- **Validation (data up to 2026-11-06):** mean per-date AUC 0.670, 95% interval [0.639, 0.717], on 87 test month-ends from 2019 to 2026. The top 10% of the ranking reached the target in 47.1% of the cases, against a base rate of 35.2%, and their mean 6-month return exceeded that of all ranked ETFs by 3.6 percentage points.
+- **Validation (data up to 2026-11-06):** mean per-date AUC 0.670, 95% interval [0.639, 0.717], on 87 test month-ends from 2019 to 2026. The top 10% of the ranking reached the target in 47.1% of the cases, against a base rate of 35.2%.
+- **Walk-forward uplift:** on 88 test month-ends, the mean 6-month return of the top 10% was 10.0% against 6.4% for all ranked ETFs (+3.6 percentage points); the top 10% were ahead on 57 of the 88 dates. The uplift was negative in 2019 (-2.4 points) and in the test dates of 2026 (-4.9 points). The dashboard shows this backtest next to the realized returns of the published predictions (see [Outputs](#outputs)).
 - **The ranking is largely a volatility ranking.** With an absolute target in a universe that mixes equity, bond and money-market ETFs, volatile ETFs reach +10% more often. A model with `vol_126` alone reached an AUC of 0.679 [0.651, 0.723], the champion without its two volatility features 0.644 [0.610, 0.685]. The median volatility percentile (`vol_126`) of the Up ETFs on the scoring date was about 90. With a relative target (beating the median ETF of the date), the champion reached 0.549 [0.509, 0.592] and `vol_126` alone 0.557 [0.514, 0.597]: over 2019-2026, the riskier ETFs also outperformed. The model therefore mainly selects ETFs with high risk and positive trends; it is not evidence of timing skill.
 - **Survivorship:** the target list contains ETFs that exist today with at least 10 years of history and current liquidity. Closed or merged ETFs are missing from the history.
 - **Duplicates:** several target ETFs track the same index; they get nearly the same rank, so the Up list can contain the same exposure more than once.
@@ -227,6 +228,8 @@ All parameters are defined in `config/settings.yaml`; `src/config.py` reads them
 | `market_index_ticker` | EUNL.DE | Market index of the market-relative candidates |
 | `macro_factor_tickers` | 8 factors | Yahoo Finance tickers of the macro factors |
 | `review_*` | | Candidate pool, inner splits, procedure parameters and switch rule of the review |
+| `uplift_lookback_days`, `uplift_match_tolerance_days` | 1m: 30, 3m: 90, 6m: 180; 15 | Lookbacks of the uplift report and the maximum distance of an archived report from them |
+| `history_retention_days` | 400 | Archived batch reports older than this are deleted |
 | `min_years_history` | 10 | Minimum history of a target ETF (scripts/build_etf_batch.py) |
 
 ---
@@ -275,6 +278,14 @@ The remaining ETFs (currently 156) are written to `config/batch_targets.json`, t
 - `validation_per_date`: AUC, top-share hit rate, base rate and the forward return of the top share minus that of all ranked ETFs per test month-end;
 - `results`: one entry per ETF with `prediction_class` (1 Up, 0 Not Up), `prediction_label`, `probability`, `rank`, `n_ranked`, `top_percent`, `latest_price`, `status` (`ok`, `model_gate_failed` or `not_eligible: <reason>`), `feature_values`, `feature_percentiles` and `logit_contributions`.
 
+**Archive (`artifacts/history/YYYY-MM/report_YYYY-MM-DD.json`)**, written by `src/main.py` after every batch run: a compact copy of the batch report, dated by the run date (Europe/Berlin), with the model essentials and the per-ETF predictions without the feature values. Reports older than `history_retention_days` (400) are deleted.
+
+**Uplift report (`artifacts/uplift_report.json`)**, written by `src/main.py` after the archive, or by `uv run python src/uplift.py` without a batch run: for the archived reports closest to 30, 90 and 180 days ago (`uplift_lookback_days`, within `uplift_match_tolerance_days` = 15), the return of every ranked ETF from its first close on or after the report date to the latest close (adjusted closes, so distributions are included), averaged per cohort: `Up`, `Not Up` and all ranked ETFs (`baseline`). Each lookback lists the report and scoring dates, whether the gate had passed, the realized period, the mean returns, the cohort sizes and the ranked ETFs without prices; a lookback without a matching report is `null`. An empty cohort is `null`, not a 0% return.
+
+**Dashboard uplift section (`index.html`):**
+- *Live:* one bar chart per lookback (1, 3 and 6 months) with the mean return of the `Not Up` and `Up` cohorts and a dashed line for all ranked ETFs; until an archived report of that age exists, the chart reads "not enough history yet". The first report was archived on 2026-11-08; with the weekly batch runs, the 1-month chart fills from about 2026-11-23, the 3-month chart from about 2027-01-22 and the 6-month chart from about 2027-04-22.
+- *Walk-forward backtest:* the 6-month return of the top share and of all ranked ETFs after every test month-end of the walk-forward validation (`validation_per_date`), with the mean uplift, the number of dates on which the top share was ahead and the uplift per year.
+
 **Review reports (`artifacts/variable_reviews/review_YYYY-MM-DD.json` and `.md`)**, written by `scripts/review_variables.py`: the decision and its reasons, the multiple-testing correction, the paired comparison per challenger, the AUC per year, the selected features per year and the per-date tables.
 
 ---
@@ -284,12 +295,12 @@ The remaining ETFs (currently 156) are written to `config/batch_targets.json`, t
 | Workflow | Trigger | Function |
 |---|---|---|
 | `Pipeline: 1. Update Seed` (`update_etf_seed.yml`) | Manual | Downloads the Xetra T7 dump, regenerates the seed list and the target list `config/batch_targets.json` |
-| `Pipeline: 2. Run Batch` (`manual_batch.yml`) | Manual | Runs the pooled model (`src/main.py`) and commits `artifacts/latest_batch_results.json` |
+| `Pipeline: 2. Run Batch` (`manual_batch.yml`) | Every Saturday at 05:23 UTC, and manual | Runs the pooled model (`src/main.py`) and commits `artifacts/latest_batch_results.json`, the archive `artifacts/history/` and `artifacts/uplift_report.json` |
 | `Pipeline: 3. Quarterly Variable Review` (`variable_review.yml`) | 2nd of February, May, August and November, and manual | Runs the review, commits its report and, on a switch, opens a pull request that changes `champion_features` and `champion_adopted` |
 | `CI: Pre-Merge Checks` (`ci.yml`) | Pull requests and pushes to `main` | Lock file, lint and tests (see [Continuous Integration](#continuous-integration)) |
 | `Release: Release Please` (`release-please.yml`) | Pushes to `main` | Release pull requests and the changelog |
 
-A pull request opened by the review workflow with the `GITHUB_TOKEN` starts its CI run only after approval (`Approve workflows to run` in the merge box).
+A pull request opened by the review workflow with the `GITHUB_TOKEN` starts its CI run only after approval (`Approve workflows to run` in the merge box). The batch runs every week because the live uplift charts need archived reports from about 1, 3 and 6 months ago (within 15 days); a Saturday run scores the Friday close.
 
 ---
 
@@ -313,7 +324,8 @@ uv run python scripts/review_variables.py --n-jobs 4 --price-cache .price_cache 
 uv run streamlit run src/app.py
 ```
 
-- `src/main.py` writes `artifacts/latest_batch_results.json`; `--ticker T` logs the rank and the feature contributions of an ETF and adds it to the ranking if it is not a target ETF.
+- `src/main.py` writes `artifacts/latest_batch_results.json`, archives it under `artifacts/history/` and writes `artifacts/uplift_report.json`; with `--output FILE` the three outputs go to the directory of FILE instead. `--ticker T` logs the rank and the feature contributions of an ETF and adds it to the ranking if it is not a target ETF.
+- `uv run python src/uplift.py` refreshes the uplift report from the archive without a batch run; it downloads the prices it needs.
 - `--price-cache DIR` reads the prices from a CSV cache if it exists and otherwise downloads them and writes the cache, for repeated local runs on the same prices.
 - A local review should write to another directory than `artifacts/variable_reviews/` (`--output-dir`), because the committed reports set m_cum.
 - The Streamlit app runs the pooled model on demand and shows the gate, the validation, the ranking and the feature contributions of one ETF.
