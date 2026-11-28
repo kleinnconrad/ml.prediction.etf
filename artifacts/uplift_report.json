@@ -1,5 +1,5 @@
 {
-  "generated_for": "2026-11-21",
+  "generated_for": "2026-11-28",
   "lookback_days": {
     "1m": 30,
     "3m": 90,
@@ -7,7 +7,25 @@
   },
   "tolerance_days": 15,
   "horizons": {
-    "1m": null,
+    "1m": {
+      "report_date": "2026-11-08",
+      "scoring_date": "2026-11-06",
+      "gate_passed": true,
+      "start": "2026-11-09",
+      "end": "2026-11-27",
+      "days": 18,
+      "metrics": {
+        "baseline": -0.020542198318236553,
+        "Up": -0.048653416206008354,
+        "Not Up": -0.017461516905878
+      },
+      "counts": {
+        "baseline": 162,
+        "Up": 16,
+        "Not Up": 146
+      },
+      "n_ranked_without_prices": 0
+    },
     "3m": null,
     "6m": null
   }
